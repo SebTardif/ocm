@@ -178,6 +178,12 @@ require strict verification. Full-copy checkpoints remain exact. Restore discard
 explicit process residue such as locks, sockets, PIDs, and temporary runtime
 directories. Legacy tar snapshots remain readable.
 
+On APFS, snapshot preparation clones the bulk tree while the gateway is running.
+The final service pause reconciles changed or removed entries and checks changed
+SQLite state before publishing the checkpoint. Failed or displaced preparation
+trees are cleaned up after service restoration or upgrade completion, not before
+restart. Other filesystems retain the fully verified copy path.
+
 Checkpoints contain secrets and share the source filesystem. Keep `OCM_HOME`
 private, allow enough space for checkpoint divergence plus a restore candidate,
 and retain an off-disk backup for disaster recovery.
