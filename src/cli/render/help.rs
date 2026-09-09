@@ -242,13 +242,19 @@ pub fn logs_help(cmd: &str) -> String {
 pub fn dev_help(cmd: &str) -> String {
     render_group(
         "Development envs",
-        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. After updating OCM, refresh an older running daemon during a maintenance window with service refresh-daemon --acknowledge-gateway-restarts so it enforces the same watch exclusion. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the watch before onboarding or changing its source/root/port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first.",
+        "Provision OpenClaw dev envs from a checkout worktree, bootstrap the minimum local config, and run the gateway in the foreground with bundled plugins resolved from that source checkout. Existing runtime or launcher envs can also be temporarily taken over with --repo <path> --watch --force; OCM keeps their binding unchanged, routes OpenClaw commands for that env through the watched checkout while watch is active, warns for installed plugins not present in the source tree, tees the foreground output to the env gateway logs, and restores a running background service when watch exits. Background service installation, start, and restart are refused while source watch is active. New watches require a compatible running daemon with verified process ownership; wait for startup or run service refresh-daemon --acknowledge-gateway-restarts from the updated OCM installation during a maintenance window. Confirmed stopped or unloaded daemons do not require refresh. New envs use the explicit --repo checkout or the checkout enclosing the current directory. Outside a checkout, pass --repo; neighboring and remembered repositories are not selected. Existing dev envs use their recorded source. Repeating a matching --watch invocation returns the existing session status and link without setup or restart. Starting and restoring sessions report progress; they are not reported as ready. Stop the watch before onboarding or changing its source/root/port. Reuse keeps the captured launch endpoint; an older watch without endpoint metadata must be stopped from its original terminal first.",
         vec![format!(
             "{cmd} dev <env> [--repo <path>] [--root <path>] [--port <port>] [--watch] [--force] [--service] [--onboard]"
         )],
         &[(
             "Commands",
-            &[("status", "Show dev envs and active source watches")],
+            &[
+                ("status", "Show dev envs and active source watches"),
+                (
+                    "stop",
+                    "Stop an owned source-watch session and restore its service",
+                ),
+            ],
         )],
         vec![
             format!("{cmd} dev shaks"),
@@ -260,9 +266,11 @@ pub fn dev_help(cmd: &str) -> String {
             format!("{cmd} dev shaks --onboard"),
             format!("{cmd} dev status"),
             format!("{cmd} dev status shaks --json"),
+            format!("{cmd} dev stop shaks"),
         ],
         vec![
             format!("{cmd} help dev status"),
+            format!("{cmd} help dev stop"),
             format!("{cmd} help service refresh-daemon"),
         ],
     )
@@ -270,6 +278,30 @@ pub fn dev_help(cmd: &str) -> String {
 
 pub fn dev_command_help(cmd: &str, action: &str) -> Option<String> {
     match action {
+        "stop" => Some(render_leaf(
+            "Stop source watch",
+            "Ask the recorded source-watch controller to stop its setup or gateway processes, or recover its owned process group after a controller crash. Preserve the env, source checkout, dependencies, and configuration.",
+            vec![format!("{cmd} dev stop <env> [--raw] [--json]")],
+            &[
+                ("<env>", "Environment whose source watch should stop"),
+                ("--raw", "Print plain output"),
+                (
+                    "--json",
+                    "Print JSON with envName, stopped, and serviceRestored",
+                ),
+            ],
+            vec![
+                format!("{cmd} dev stop shaks"),
+                format!("{cmd} dev stop shaks --json"),
+            ],
+            &[
+                "Waits for the owned source processes to stop before restoring a background service taken over by --watch --force.",
+                "Does not stop an ordinary foreground run or an independently managed background service.",
+                "Older watches without recorded ownership must be stopped from their original terminal. Unverifiable process identity or cleanup retains the unfinished session and reports an error.",
+                "On Windows, recovery cannot verify a controller crash before child ownership is published; that unfinished session is retained for operator recovery.",
+                "After updating OCM, refresh an older running daemon from that installation with service refresh-daemon --acknowledge-gateway-restarts so it uses the same ownership locks.",
+            ],
+        )),
         "status" => Some(render_leaf(
             "Show dev env status",
             "Inspect source watch ownership, source paths, gateway ports, and observed service state for one env or all dev sessions.",

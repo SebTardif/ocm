@@ -1829,7 +1829,7 @@ fn contended_admission_preserves_sibling_supervision_and_desired_starts() {
     let runtime_path = root.child("ocm-home/supervisor/runtime.json");
     let supervisor = SupervisorService::new(&env, &cwd);
     supervisor.sync().unwrap();
-    let admission_path = root.child("ocm-home/source-watch/demo.admission.lock");
+    let admission_path = root.child("ocm-home/source-watch/demo.admission");
     fs::create_dir_all(admission_path.parent().unwrap()).unwrap();
     let hold_admission = || {
         let file = fs::OpenOptions::new()
@@ -1942,7 +1942,7 @@ fn daemon_publishes_a_started_child_before_a_sibling_probe_can_block() {
     let admission = fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .open(root.child("ocm-home/source-watch/demo.admission.lock"))
+        .open(root.child("ocm-home/source-watch/demo.admission"))
         .unwrap();
     let admission_available = FileExt::try_lock_exclusive(&admission).is_ok();
     fs::write(&probe_release, "release\n").unwrap();
@@ -1987,6 +1987,8 @@ fn daemon_run_persists_live_runtime_children() {
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let runtime = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(5))
         .expect("daemon runtime state did not report running children");
+    let daemon_pid = daemon.id();
+    let gateway_admission = runtime["gatewayAdmission"].clone();
     assert_eq!(runtime["kind"], "ocm-supervisor-runtime");
     assert_eq!(runtime["daemonVersion"], env!("CARGO_PKG_VERSION"));
 
@@ -2000,6 +2002,14 @@ fn daemon_run_persists_live_runtime_children() {
     let cleared = wait_for_runtime_children(&runtime_path, 0, None, Duration::from_secs(5))
         .expect("daemon runtime state did not clear after shutdown");
     assert!(cleared["updatedAt"].as_str().is_some());
+    assert_eq!(gateway_admission["version"], 1);
+    assert_eq!(gateway_admission["process"]["pid"], daemon_pid);
+    assert!(
+        gateway_admission["process"]["startedAt"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty())
+    );
+    assert_eq!(cleared["gatewayAdmission"], gateway_admission);
 }
 
 #[test]
@@ -2027,6 +2037,7 @@ fn daemon_run_once_executes_planned_children() {
 
     assert_eq!(fs::read_to_string(launcher_marker).unwrap(), "launcher\n");
     assert_eq!(fs::read_to_string(runtime_marker).unwrap(), "runtime\n");
+    assert!(!root.child("ocm-home/supervisor/runtime.json").exists());
 }
 
 #[test]
