@@ -391,6 +391,10 @@ Use `ocm` when you want:
 
 Manual setup works. `ocm` is what makes it feel organized.
 
+On Unix, updates to an already-private OpenClaw config preserve its private
+access. OCM creates the replacement privately and verifies protection before
+writing data; files with other authored access rules keep the existing writer.
+
 ## Learn more
 
 For the full guide, including scenarios and command details, see [docs/USAGE.md](docs/USAGE.md).
