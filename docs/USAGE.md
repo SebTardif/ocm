@@ -425,6 +425,17 @@ ocm self update --check
 
 ## Environment lifecycle
 
+Environment creation, including `start` and migration, and `env clone` and
+`env import` require a root outside every registered dev worktree that exists
+on disk. The root must neither contain an existing registered source nor be
+inside it. OCM resolves source and destination aliases and also protects source
+symlinks that failed clone or import cleanup would remove. Choose a separate
+environment root.
+
+When OCM reports that it cannot resolve or inspect a registered source, it stops
+before writing the destination. Check the recorded source with `ocm env show
+<env>`, restore that checkout's path or access permissions, then retry.
+
 ### Clone an environment
 
 ```bash
