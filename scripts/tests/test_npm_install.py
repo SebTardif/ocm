@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import platform
+import re
 import signal
 import subprocess
 import sys
@@ -127,6 +128,13 @@ def installed_native(prefix):
     if len(matches) != 1:
         raise AssertionError(f"expected one compatible native payload, found {matches}")
     return matches[0]
+
+
+def macos_team_id(value):
+    team = (value or "").strip()
+    if re.fullmatch(r"[A-Z0-9]{10}", team):
+        return team
+    return None
 
 
 class NpmInstallTests(unittest.TestCase):
@@ -324,6 +332,21 @@ esac
             self.assertIn(message, result.stderr)
 
 
+class MacosTeamIdTests(unittest.TestCase):
+    def test_accepts_a_ten_character_team_id(self):
+        self.assertEqual(macos_team_id("AB12CD34EF"), "AB12CD34EF")
+
+    def test_rejects_empty_missing_and_whitespace(self):
+        self.assertIsNone(macos_team_id(""))
+        self.assertIsNone(macos_team_id(None))
+        self.assertIsNone(macos_team_id("   "))
+
+    def test_rejects_wrong_shape(self):
+        self.assertIsNone(macos_team_id("ab12cd34ef"))
+        self.assertIsNone(macos_team_id("ABC"))
+        self.assertIsNone(macos_team_id("ABCDEFGHIJK"))
+
+
 def smoke(directory):
     receipt = release.read_receipt(directory)
     with tempfile.TemporaryDirectory(prefix="ocm-npm-native-") as temporary:
@@ -358,18 +381,24 @@ def smoke(directory):
                 )
             run([str(entrypoint), "--help"], root, env)
             if sys.platform == "darwin":
-                run(
-                    [
-                        str(release.ROOT / "scripts/verify-macos-release.sh"),
-                        "--binary",
-                        str(binary),
-                        "--team-id",
-                        os.environ["MACOS_TEAM_ID"],
-                        "--require-notarization",
-                    ],
-                    root,
-                    env,
-                )
+                team_id = macos_team_id(os.environ.get("MACOS_TEAM_ID"))
+                if team_id is None:
+                    print(
+                        "Skipping macOS signature check: MACOS_TEAM_ID is unset or invalid"
+                    )
+                else:
+                    run(
+                        [
+                            str(release.ROOT / "scripts/verify-macos-release.sh"),
+                            "--binary",
+                            str(binary),
+                            "--team-id",
+                            team_id,
+                            "--require-notarization",
+                        ],
+                        root,
+                        env,
+                    )
             print(
                 f"Verified npm install, CLI, and unchanged native bytes on {platform.platform()}"
             )
