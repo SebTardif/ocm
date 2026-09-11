@@ -137,6 +137,17 @@ def macos_team_id(value):
     return None
 
 
+def macos_signature_command(value, *, require_signature):
+    team_id = macos_team_id(value)
+    if team_id:
+        return ["--team-id", team_id, "--require-notarization"]
+    if require_signature:
+        raise AssertionError(
+            "MACOS_TEAM_ID must be a 10-character Apple Developer Team ID"
+        )
+    return None
+
+
 class NpmInstallTests(unittest.TestCase):
     def test_real_global_upgrade_reinstall_local_npx_and_missing_optionals(self):
         with tempfile.TemporaryDirectory(prefix="ocm-npm-test-") as temporary:
@@ -346,8 +357,51 @@ class MacosTeamIdTests(unittest.TestCase):
         self.assertIsNone(macos_team_id("ABC"))
         self.assertIsNone(macos_team_id("ABCDEFGHIJK"))
 
+    def test_publication_rejects_empty_team_id(self):
+        with self.assertRaisesRegex(AssertionError, "10-character"):
+            macos_signature_command("", require_signature=True)
 
-def smoke(directory):
+    def test_fork_fixture_skips_empty_team_id(self):
+        self.assertIsNone(macos_signature_command("", require_signature=False))
+
+    def test_valid_team_id_always_verifies(self):
+        expected = ["--team-id", "AB12CD34EF", "--require-notarization"]
+        self.assertEqual(
+            macos_signature_command("AB12CD34EF", require_signature=True), expected
+        )
+        self.assertEqual(
+            macos_signature_command("AB12CD34EF", require_signature=False), expected
+        )
+
+    def test_publication_smoke_rejects_empty_team_id_before_install(self):
+        if sys.platform != "darwin":
+            self.skipTest("macOS signature path is darwin-only")
+        with unittest.mock.patch.dict(os.environ, {"MACOS_TEAM_ID": ""}, clear=False):
+            with self.assertRaisesRegex(AssertionError, "10-character"):
+                smoke(
+                    Path("/tmp/ocm-npm-missing-packages"),
+                    require_macos_signature=True,
+                )
+
+    def test_fork_fixture_smoke_skips_empty_team_id_before_install(self):
+        if sys.platform != "darwin":
+            self.skipTest("macOS signature path is darwin-only")
+        missing = Path("/tmp/ocm-npm-missing-packages")
+        with unittest.mock.patch.dict(os.environ, {"MACOS_TEAM_ID": ""}, clear=False):
+            with self.assertRaises(Exception) as ctx:
+                smoke(missing, require_macos_signature=False)
+        self.assertNotRegex(str(ctx.exception), "10-character")
+
+
+def smoke(directory, *, require_macos_signature=True):
+    signature_command = None
+    if sys.platform == "darwin":
+        signature_command = macos_signature_command(
+            os.environ.get("MACOS_TEAM_ID"),
+            require_signature=require_macos_signature,
+        )
+        if signature_command is None:
+            print("Skipping macOS signature check: MACOS_TEAM_ID is unset or invalid")
     receipt = release.read_receipt(directory)
     with tempfile.TemporaryDirectory(prefix="ocm-npm-native-") as temporary:
         root = Path(temporary)
@@ -380,25 +434,17 @@ def smoke(directory):
                     "installed executable version differs from package"
                 )
             run([str(entrypoint), "--help"], root, env)
-            if sys.platform == "darwin":
-                team_id = macos_team_id(os.environ.get("MACOS_TEAM_ID"))
-                if team_id is None:
-                    print(
-                        "Skipping macOS signature check: MACOS_TEAM_ID is unset or invalid"
-                    )
-                else:
-                    run(
-                        [
-                            str(release.ROOT / "scripts/verify-macos-release.sh"),
-                            "--binary",
-                            str(binary),
-                            "--team-id",
-                            team_id,
-                            "--require-notarization",
-                        ],
-                        root,
-                        env,
-                    )
+            if signature_command is not None:
+                run(
+                    [
+                        str(release.ROOT / "scripts/verify-macos-release.sh"),
+                        "--binary",
+                        str(binary),
+                        *signature_command,
+                    ],
+                    root,
+                    env,
+                )
             print(
                 f"Verified npm install, CLI, and unchanged native bytes on {platform.platform()}"
             )
@@ -424,7 +470,7 @@ def published_binary_fixture():
             (release.ROOT / "npm/README.md").read_bytes(),
             output,
         )
-        smoke(output)
+        smoke(output, require_macos_signature=False)
 
 
 if __name__ == "__main__":
