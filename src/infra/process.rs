@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,7 @@ pub(crate) fn command_output(
         command.process_group(0);
     }
 
+    let deadline = Instant::now() + timeout;
     let mut child = command
         .spawn()
         .map_err(|error| format!("failed to run {label}: {error}"))?;
@@ -58,21 +60,58 @@ pub(crate) fn command_output(
         .take()
         .ok_or_else(|| format!("{label} stderr was not captured"))?;
 
-    let stdout_reader = thread::spawn(move || read_pipe(stdout));
-    let stderr_reader = thread::spawn(move || read_pipe(stderr));
+    let (stdout_tx, stdout_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = stdout_tx.send(read_pipe(stdout));
+    });
+    let (stderr_tx, stderr_rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = stderr_tx.send(read_pipe(stderr));
+    });
 
     let status = wait_for_child(&mut child, timeout, label);
-    let stdout = stdout_reader
-        .join()
-        .map_err(|_| format!("{label} stdout reader panicked"))?;
-    let stderr = stderr_reader
-        .join()
-        .map_err(|_| format!("{label} stderr reader panicked"))?;
+    let stdout = recv_pipe(stdout_rx, deadline, &mut child, label, "stdout");
+    let stderr = recv_pipe(stderr_rx, deadline, &mut child, label, "stderr");
+    let status = match status {
+        Ok(status) => status,
+        Err(error) => return Err(error),
+    };
     Ok(Output {
-        status: status?,
-        stdout,
-        stderr,
+        status,
+        stdout: stdout?,
+        stderr: stderr?,
     })
+}
+
+fn recv_pipe(
+    rx: mpsc::Receiver<Vec<u8>>,
+    deadline: Instant,
+    child: &mut Child,
+    label: &str,
+    stream: &str,
+) -> Result<Vec<u8>, String> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    let wait = if remaining.is_zero() {
+        Duration::from_millis(1)
+    } else {
+        remaining
+    };
+    match rx.recv_timeout(wait) {
+        Ok(buf) => Ok(buf),
+        Err(RecvTimeoutError::Timeout) => {
+            terminate_child(child);
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(buf) => Ok(buf),
+                Err(RecvTimeoutError::Timeout) => Err(format!(
+                    "{label} timed out draining {stream} after {wait:?}"
+                )),
+                Err(RecvTimeoutError::Disconnected) => {
+                    Err(format!("{label} {stream} reader disconnected"))
+                }
+            }
+        }
+        Err(RecvTimeoutError::Disconnected) => Err(format!("{label} {stream} reader disconnected")),
+    }
 }
 
 fn read_pipe(mut reader: impl std::io::Read) -> Vec<u8> {
