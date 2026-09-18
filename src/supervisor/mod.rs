@@ -1387,29 +1387,7 @@ fn wait_child_with_timeout(
 }
 
 fn terminate_child(child: &mut Child) {
-    #[cfg(unix)]
-    {
-        let process_group = format!("-{}", child.id());
-        let _ = Command::new("kill")
-            .args(["-TERM", "--", &process_group])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        for _ in 0..20 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => sleep(Duration::from_millis(25)),
-                Err(_) => break,
-            }
-        }
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &process_group])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.kill();
-    let _ = child.wait();
+    terminate_process_group(child);
 }
 
 fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
@@ -2360,16 +2338,20 @@ fn start_due_children(
 }
 
 fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) {
+    terminate_process_group(&mut running_child.child);
+}
+
+fn terminate_process_group(child: &mut Child) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", running_child.child.id());
+        let process_group = format!("-{}", child.id());
         let _ = Command::new("kill")
             .args(["-TERM", "--", &process_group])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
         for _ in 0..20 {
-            let _ = running_child.child.try_wait();
+            let _ = child.try_wait();
             if !supervisor_process_group_exists(&process_group) {
                 break;
             }
@@ -2382,7 +2364,7 @@ fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) {
                 .stderr(Stdio::null())
                 .status();
             for _ in 0..20 {
-                let _ = running_child.child.try_wait();
+                let _ = child.try_wait();
                 if !supervisor_process_group_exists(&process_group) {
                     break;
                 }
@@ -2393,8 +2375,8 @@ fn stop_supervisor_child(running_child: &mut RunningSupervisorChild) {
     // Always wait on the process-group leader. It can exit after try_wait()
     // reports None but before the group-existence probe; returning in that
     // window leaves a zombie that can block OpenClaw's single-instance lock.
-    let _ = running_child.child.kill();
-    let _ = running_child.child.wait();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 #[cfg(unix)]
@@ -4316,5 +4298,51 @@ mod tests {
         let status = wait_child_with_timeout(&mut child, Duration::from_millis(200), "true")
             .expect("exited child should not time out");
         assert!(status.success());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_child_with_timeout_kills_term_resistant_descendant() {
+        use std::os::unix::process::CommandExt;
+
+        let pidfile =
+            std::env::temp_dir().join(format!("ocm-once-descendant-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pidfile);
+        let mut child = Command::new("perl")
+            .env("OCM_DESCENDANT_PIDFILE", &pidfile)
+            .args([
+                "-e",
+                "if (fork()) { sleep 30; exit 0 } $SIG{TERM}='IGNORE'; open F, '>', $ENV{OCM_DESCENDANT_PIDFILE} or die; print F \"$$\\n\"; close F; sleep 30",
+            ])
+            .process_group(0)
+            .spawn()
+            .expect("spawn perl descendant holder");
+        let error = wait_child_with_timeout(&mut child, Duration::from_millis(800), "pipe-hold")
+            .expect_err("leader should time out");
+        assert!(
+            error.contains("timed out"),
+            "expected timeout error, got {error}"
+        );
+        let pid = fs::read_to_string(&pidfile)
+            .unwrap_or_default()
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid file");
+        let _ = fs::remove_file(&pidfile);
+        let alive = Command::new("kill")
+            .args(["-0", "--", &pid.to_string()])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|status| status.success());
+        if alive {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &pid.to_string()])
+                .status();
+        }
+        assert!(
+            !alive,
+            "TERM-resistant descendant {pid} should be gone after group KILL"
+        );
     }
 }
