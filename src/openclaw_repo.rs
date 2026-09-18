@@ -1140,6 +1140,51 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn git_timeout_kills_term_resistant_descendant() {
+        use std::time::{Duration, Instant};
+
+        let pidfile =
+            std::env::temp_dir().join(format!("ocm-pipe-hold-{}.pid", std::process::id()));
+        let _ = fs::remove_file(&pidfile);
+        let started = Instant::now();
+        let mut command = Command::new("perl");
+        command.env("OCM_DESCENDANT_PIDFILE", &pidfile);
+        command.args([
+            "-e",
+            "if (fork()) { exit 0 } $SIG{TERM}='IGNORE'; open F, '>', $ENV{OCM_DESCENDANT_PIDFILE} or die; print F \"$$\\n\"; close F; sleep 30",
+        ]);
+        let _ = command_output(command, Duration::from_millis(800), "pipe-hold");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "runner should return before the 30s descendant, took {elapsed:?}"
+        );
+        let pid = fs::read_to_string(&pidfile)
+            .unwrap_or_default()
+            .trim()
+            .parse::<u32>()
+            .expect("descendant pid file");
+        let _ = fs::remove_file(&pidfile);
+        let alive = Command::new("kill")
+            .args(["-0", "--", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if alive {
+            let _ = Command::new("kill")
+                .args(["-KILL", "--", &pid.to_string()])
+                .status();
+        }
+        assert!(
+            !alive,
+            "TERM-resistant descendant {pid} should be gone after group KILL"
+        );
+    }
+
     fn run_git(repo: &std::path::Path, args: &[&str]) {
         let output = Command::new("git")
             .arg("-C")

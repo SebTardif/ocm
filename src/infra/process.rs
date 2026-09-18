@@ -147,21 +147,41 @@ pub(crate) fn wait_for_child(
 fn terminate_child(child: &mut Child) {
     #[cfg(unix)]
     {
-        let process_group = format!("-{}", child.id());
+        let pgid = child.id();
+        let process_group = format!("-{pgid}");
         let _ = Command::new("kill")
             .args(["-TERM", "--", &process_group])
             .status();
         for _ in 0..20 {
-            match child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => thread::sleep(Duration::from_millis(25)),
-                Err(_) => break,
+            let _ = child.try_wait();
+            if !process_group_has_live_members(pgid) {
+                let _ = child.wait();
+                return;
             }
+            thread::sleep(Duration::from_millis(25));
         }
         let _ = Command::new("kill")
             .args(["-KILL", "--", &process_group])
             .status();
+        for _ in 0..20 {
+            let _ = child.try_wait();
+            if !process_group_has_live_members(pgid) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
     }
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[cfg(unix)]
+fn process_group_has_live_members(pgid: u32) -> bool {
+    Command::new("kill")
+        .args(["-0", "--", &format!("-{pgid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
