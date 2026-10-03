@@ -29,6 +29,9 @@ All notable changes to OCM are documented here.
 
 ### Changed
 
+- Update `cc` to 1.5.1, `find-msvc-tools` to 0.1.14, and `smallvec` to 1.16.2 while retaining Rust 1.88 support.
+- Define ordered remote development checks, isolated checkout transfer, and proof reuse in the contributor guide. Thanks @shakkernerd (#290).
+- Update fresh managed Node.js installs and CI to 24.21.0 while preserving cached 24.15.0 toolchains across OCM upgrades.
 - Document live npm and Homebrew availability in v0.2.40, observed one-time
   bootstrap recovery, and the manual ARM payload's provenance exception.
 - Keep package-manager distribution on npm and Homebrew only; disable Cargo
@@ -39,6 +42,10 @@ All notable changes to OCM are documented here.
 
 ### Fixed
 
+- Preserve Skill Workshop proposal hashes, support files, and rollback evidence during home import and runtime cleanup. Thanks @Patrick-Erichsen (#245).
+- Reject mixed or malformed candidate preflight failures instead of treating an unsupported-check marker as success. Thanks @shakkernerd for the report and @goutamadwant for the fix (#128, #165).
+- Accept reformatted and binary macOS LaunchAgent plists for the same OCM store while still rejecting foreign or invalid owners. Thanks @TheAngryPit (#147, #149).
+- Reject linked environment archive roots and metadata before import or legacy snapshot restore can read files outside the extracted archive.
 - Keep npm-owned executable updates with npm, prevent temporary npx caches from
   owning background services, and preserve process identity during npm-launched
   gateway refreshes. Protect managed and symlinked installer destinations even

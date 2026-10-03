@@ -92,7 +92,7 @@ Inside this repo, use the development wrapper:
 
 Published OpenClaw release flows in `ocm` prefer host Node.js `22.22.3+`,
 `24.15.0+`, or `25.9.0+` and `npm`.
-On supported platforms, `ocm` can manage a private copy for official release installs when those tools are missing.
+On supported platforms, `ocm` can manage a private Node.js 24.21.0 copy for official release installs when those tools are missing. Existing private 24.15.0 toolchains remain usable without a download when upgrading OCM.
 Interactive release setup can also offer to install `git` for repo-aware coding workflows when it is missing.
 Local checkout flows keep using whatever command and toolchain you choose.
 
@@ -210,6 +210,17 @@ ocm upgrade simulate mira --to beta --scenario all
 ocm upgrade simulate mira --to ./openclaw
 ```
 
+On Unix, `ocm upgrade job start mira --json` starts an independent OCM worker and returns its request ID before the upgrade runs.
+Use `ocm upgrade job status mira --request-id <id> --json` to reconnect to that exact request, or omit `--request-id` for the latest job.
+Clients can copy `bindingKind:bindingName` from `ocm upgrade job capabilities mira` into `start --if-binding <kind>:<name>` to reject a binding change before the upgrade runs.
+The worker uses the ordinary upgrade checks, checkpoints, and recovery for the environment's binding, and continues when the requesting terminal or managed Gateway exits.
+See [asynchronous upgrades](docs/USAGE.md#asynchronous-upgrades) for result and interruption behavior.
+
+Supported source launchers can update their checkout in place through the same no-target command on Linux and macOS.
+OCM preserves the source binding and uses native source artifact reporting, update execution, and recovery.
+Older checkouts without native source observations remain `local-command`, with support reported as unknown.
+See [source upgrade behavior and recovery](docs/USAGE.md#upgrade-one-environment) for compatibility and checkpoint limits.
+
 Live upgrades and rollbacks require a completed foreground dev session. Request
 shutdown of recorded ownership with `ocm dev stop <env>`. Older watches without
 an unfinished ownership record must be stopped from their original dev terminal.
@@ -249,6 +260,10 @@ directories as independent before upgrading:
 ocm env set-independent-paths mira .openclaw/workspace/projects
 ```
 
+Explicit declarations also support `.openclaw/worktrees` and non-hidden
+development directories elsewhere in the environment home. Other hidden
+home/state namespaces, including credentials and the state database, stay protected.
+
 Upgrade checkpoints then omit those directories without reading their contents,
 and rollback restores the surrounding owned state while leaving those directories
 in place. The list is explicit and empty by default; names such as `node_modules`
@@ -278,6 +293,12 @@ creating a snapshot, downloading the target, or changing runtime metadata.
 Switching only the binary cannot reverse newer OpenClaw config or SQLite state
 migrations; returning to an older release requires a checkpoint of its owned state captured
 while that release and its state schema were active.
+After restarting an installed OpenClaw package, or restoring a recognized source launcher during upgrade rollback, OCM compares the bound artifact's build ID with the running Gateway's build ID when both are available.
+A mismatch fails verification and follows the upgrade's rollback policy, even when the reported versions match.
+Older packages, source artifacts, and status responses remain supported; when the artifact has a build ID but the Gateway cannot report one, the verification note says that running build identity is unavailable.
+Source verification reads the current checkout's build metadata without inspecting Git or rebuilding it.
+It does not prove that historical source contents were preserved or that an in-place source rollback is safe.
+Launcher bindings retain their existing version and readiness checks.
 `ocm upgrade history <env>` lists completed upgrade transactions newest first,
 including source and target bindings and versions, the pre-upgrade snapshot,
 migration/finalization status, service state, and rollback outcome. History is
@@ -298,6 +319,12 @@ safety snapshot and a linked history transaction before it stops a managed
 service or replaces runtime bytes. If restore or verification fails, OCM puts
 the pre-rollback runtime and environment state back. Rolling back the linked
 transaction safely reverses the rollback.
+If rollback itself fails, OCM retains the pre-operation runtime files and snapshot and reports recovery as unresolved.
+Use `ocm upgrade history <env> --json` to inspect the transaction, its snapshot, and retained runtime recovery metadata.
+Preserve the locations printed in the failure result when metadata could not be written.
+Do not remove those files or prune the snapshot until operator recovery is complete; retained files are evidence for recovery, not proof that the environment or service was restored.
+This does not add automatic recovery after abrupt process loss.
+
 Dev environments retain their current source binding during restore.
 Manual snapshot restore also keeps their current runtime/launcher binding;
 upgrade rollback restores the recorded runtime/launcher instead.
@@ -306,6 +333,11 @@ Once an environment is bound to a runtime, direct `runtime update`,
 operations reject that runtime. Use `ocm upgrade <env>` so the environment gets
 the snapshot, OpenClaw migration, rollback, and verification path, or clear the
 binding first when intentionally managing an unused runtime.
+
+Runtime package and companion installation preserves the caller's npm settings,
+including script policy and home-relative configuration. OpenClaw lifecycle
+state uses a disposable directory, and inherited service state paths are cleared
+so installation cannot discover the caller's OpenClaw state through those paths.
 
 For unreleased OpenClaw workspaces, `runtime build-local` follows the complete
 transitive closure of private `workspace:*` packages. It rewrites nested
@@ -400,8 +432,14 @@ After independently verifying that **all source processes, including detached wo
 
 `ocm env destroy <env> --yes` stops the recorded foreground generation and verifies shutdown before removing the environment. It rechecks the binding after stopping and preserves state if another owner or binding appears. While a watch is running, previews defer the changing process-tree inspection until after shutdown (`processInspectionDeferred` in JSON). `env remove` and `env prune` refuse active or unfinished watches; stop those sessions first. A guarded destroy with `--if-state-token` also requires `dev stop` followed by a fresh preview, so its original state guarantee remains intact. Completed watch records are removed with the env; synchronization lock files remain reusable.
 
-Environment creation, cloning, and import reject roots that overlap registered
-dev sources, including source and destination aliases. Missing borrowed paths
+New environment roots must be separate: a root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+Creation, cloning, import, and other commands that create an environment reject
+overlap before writing environment state, regardless of protection flags.
+Default sibling roots and disjoint custom roots remain valid.
+
+These operations also reject roots that overlap registered dev sources,
+including source and destination aliases. Missing borrowed paths
 remain reserved until their binding is removed. Removing a borrowed environment
 preserves its source, dependencies, generated output, and unrelated source workers.
 Restore and rollback also preserve borrowed source and known Git metadata;
@@ -435,6 +473,16 @@ ocm adopt plan --name mira
 
 `migrate` preserves config, auth, sessions, logs, and other durable user state, rewrites env-scoped paths for the new managed root, and clears only live runtime residue like locks, pid files, and sockets. If `openclaw` is already available on `PATH`, it also binds the imported env to an env-local migrated launcher so you can keep using it through OCM immediately.
 
+Legacy configuration, system-agent, and Crestodian audit files retain their original
+bytes, including migrated archives and recovery files. Their historical paths stay
+unchanged so OpenClaw can verify its existing audit checkpoints. OCM excludes these
+paths from copied-runtime-reference diagnostics. This also applies to `adopt import`.
+
+Skill Workshop bundles also retain their original bytes, including drafts, support
+files, proposal metadata, and rollback receipts. OpenClaw owns their stored hashes
+and target relocation; OCM preserves the historical paths and excludes them from
+copied-runtime-reference diagnostics.
+
 When a configured agent workspace is a repository checkout outside the plain
 OpenClaw home, including through a symlink, migration copies that workspace into
 the new environment and rewrites the imported config to use the copy. The source
@@ -444,7 +492,13 @@ inside the plain home because OCM does not take ownership of external config.
 Environment clone, export, and import flows preserve managed OpenClaw plugin
 payloads under the legacy, extension, npm, and Git install roots. Clone and
 import still clear live sessions, logs, backups, and process residue so the new
-environment does not share active runtime state with its source.
+environment does not share active runtime state with its source. New clones also
+clear copied agent database process leases while keeping the state database,
+durable rows, and source leases unchanged.
+
+Cloned plugin registrations use the clone's managed files. Copied local projects
+and archives retain their original source information, and missing managed
+payloads retain clone-owned records for independent diagnosis or repair.
 
 Clone, import, and migration give the target environment a new local gateway and MCP app sandbox listener. They do not copy a public `mcp.apps.sandboxOrigin` because that URL belongs to the source environment's external routing and may still reach the source sandbox. Direct connections derive the target sandbox port automatically. For a target behind a reverse proxy or tunnel, pass its dedicated public origin explicitly:
 

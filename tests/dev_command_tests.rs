@@ -1467,6 +1467,67 @@ fn wait_for_ui_command_cleanup(root: &TestDir) {
     }
 }
 
+#[test]
+fn dev_ui_dashboard_publishes_complete_pid() {
+    let root = TestDir::new("dev-ui-dashboard-pid-publication");
+    let config = root.child("openclaw.json");
+    fs::write(&config, r#"{"gateway":{"controlUi":{}}}"#).unwrap();
+    let fixture = root.child("dev-ui-fixture.cjs");
+    fs::write(&fixture, include_str!("support/dev_ui.cjs")).unwrap();
+    let mut env = ocm_env(&root);
+    env.insert("OCM_TEST_DEV_UI_DIR".into(), path_string(root.path()));
+    env.insert("OPENCLAW_CONFIG_PATH".into(), path_string(&config));
+    env.insert("OPENCLAW_GATEWAY_PORT".into(), "19789".into());
+    let child = Command::new("node")
+        .args([
+            "-e",
+            r#"
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const published = path.join(process.env.OCM_TEST_DEV_UI_DIR, 'dashboard-attempt-1');
+const writeFile = fs.writeFileSync;
+let pidWrites = 0;
+setTimeout(() => { throw new Error('dashboard fixture did not finish'); }, 5000).unref();
+fs.writeFileSync = (destination, data, ...options) => {
+  if (data !== String(process.pid)) return writeFile(destination, data, ...options);
+  pidWrites++;
+  // Observe the real open-before-write interval without delaying the reader.
+  const fd = fs.openSync(destination, 'w');
+  try {
+    assert.equal(fs.fstatSync(fd).size, 0);
+    assert.equal(fs.existsSync(published), false, 'PID path appeared before contents were ready');
+    writeFile(fd, data, ...options);
+  } finally {
+    fs.closeSync(fd);
+  }
+};
+require(process.argv[1]);
+assert.equal(pidWrites, 1, 'the actual dashboard PID write must be observed');
+"#,
+            &path_string(&fixture),
+            "dashboard",
+        ])
+        .current_dir(root.path())
+        .env_clear()
+        .envs(&env)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let output = child.wait_with_output().unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(root.child("dashboard-attempt-1"))
+            .unwrap()
+            .parse::<u32>()
+            .unwrap(),
+        pid
+    );
+}
+
 #[cfg(unix)]
 fn ui_dashboard_pid(root: &TestDir, attempt: usize) -> u32 {
     let path = root.child(format!("dashboard-attempt-{attempt}"));
@@ -4371,6 +4432,7 @@ fn dev_status_reports_dev_envs() {
         updated_at: now_utc(),
         services: vec![],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "dev".to_string(),
             binding_name: summary["worktreeRoot"].as_str().unwrap().to_string(),
@@ -5717,8 +5779,9 @@ fn dev_stop_acknowledgement_refuses_live_recorded_ownership() {
     let started = root.child("source-watch.started");
     let release = root.child("source-watch.release");
     let worker_path = root.child("source-watch-descendant.pid");
+    // Wait in the shell so killing the leader cannot orphan another polling sleep.
     let script = format!(
-        "#!/bin/sh\n(while [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done) &\nprintf '%s\\n' \"$!\" > \"{worker}\"\nprintf ready > \"{started}\"\nwhile [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done\n",
+        "#!/bin/sh\n(while [ ! -f \"{release}\" ]; do /bin/sleep 0.05; done) &\nprintf '%s\\n' \"$!\" > \"{worker}\"\nprintf ready > \"{started}\"\nwait \"$!\"\n",
         release = path_string(&release),
         worker = path_string(&worker_path),
         started = path_string(&started),
@@ -7136,6 +7199,7 @@ fn dev_watch_aborts_and_restores_policy_when_service_stop_times_out() {
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "runtime".to_string(),
             binding_name: "stable".to_string(),

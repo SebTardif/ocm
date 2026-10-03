@@ -177,9 +177,15 @@ pub(crate) fn prepare_migrated_runtime_state(
         &paths.state_dir.join("state/openclaw.sqlite"),
         source_state_root,
         &paths.state_dir,
+        PluginPathRelocation::Imported,
     )?;
     changed |= plugin_paths.changed;
-    changed |= clear_volatile_runtime_state(&paths.state_dir, &paths.config_path, &workspaces)?;
+    changed |= clear_volatile_runtime_state(
+        &paths.state_dir,
+        &paths.state_dir,
+        &paths.config_path,
+        &workspaces,
+    )?;
     Ok(MigratedRuntimeStateResult {
         changed,
         external_plugin_ids: plugin_paths.external_plugin_ids,
@@ -209,6 +215,7 @@ pub(crate) fn clear_nonportable_runtime_state(
         if name == OsStr::new("openclaw.json")
             || is_durable_openclaw_state_root(&name)
             || workspaces.contains(&path)
+            || is_integrity_protected_history_path(&paths.state_dir, &path)
         {
             continue;
         }
@@ -249,6 +256,7 @@ fn rewrite_runtime_state_root_refs(
     let target_root = display_path(target_state_root);
     rewrite_runtime_state_root_refs_inner(
         root,
+        root,
         config_path,
         workspaces,
         &source_root,
@@ -259,6 +267,7 @@ fn rewrite_runtime_state_root_refs(
 }
 
 fn rewrite_runtime_state_root_refs_inner(
+    state_root: &Path,
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
@@ -281,6 +290,7 @@ fn rewrite_runtime_state_root_refs_inner(
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if metadata.is_dir() {
             rewrite_runtime_state_root_refs_inner(
+                state_root,
                 &path,
                 config_path,
                 workspaces,
@@ -290,7 +300,7 @@ fn rewrite_runtime_state_root_refs_inner(
             )?;
             continue;
         }
-        if !metadata.is_file() {
+        if !metadata.is_file() || is_integrity_protected_history_path(state_root, &path) {
             continue;
         }
 
@@ -308,12 +318,125 @@ fn rewrite_runtime_state_root_refs_inner(
     Ok(())
 }
 
+// Workshop drafts, support files, and rollback receipts share stored hashes.
+// OpenClaw owns their validation and target relocation; rewriting even embedded
+// path text can invalidate the bundle or change the content restored by rollback.
+fn is_integrity_protected_history_path(state_root: &Path, path: &Path) -> bool {
+    path.strip_prefix(state_root)
+        .is_ok_and(|relative| relative.starts_with("skill-workshop"))
+        || is_legacy_audit_history_path(state_root, path)
+}
+
+// OpenClaw validates these historical bytes against its audit checkpoints.
+// Paths in them are provenance, not runtime references to relocate or repair.
+fn is_legacy_audit_history_path(state_root: &Path, path: &Path) -> bool {
+    let Ok(relative) = path.strip_prefix(state_root) else {
+        return false;
+    };
+    let basenames: &[&str] = match relative.parent() {
+        Some(parent) if parent == Path::new("logs") => &["config-audit.jsonl"],
+        Some(parent) if parent == Path::new("audit") => &["system-agent.jsonl", "crestodian.jsonl"],
+        _ => return false,
+    };
+    let Some(name) = relative.file_name().and_then(OsStr::to_str) else {
+        return false;
+    };
+    basenames.iter().any(|basename| {
+        if let Some(claim) = name.strip_prefix('.') {
+            return claim
+                .strip_prefix(basename)
+                .and_then(|suffix| suffix.strip_prefix(".doctor-importing"))
+                .is_some_and(is_legacy_audit_generation);
+        }
+        let Some(suffix) = name.strip_prefix(basename) else {
+            return false;
+        };
+        if suffix.is_empty() {
+            return true;
+        }
+        let Some(archive) = suffix.strip_prefix(".migrated") else {
+            return false;
+        };
+        let (generation, recovery) = archive.split_once(".raw").unwrap_or((archive, ""));
+        is_legacy_audit_generation(generation)
+            && matches!(
+                recovery,
+                "" | ".doctor-scrub-restore" | ".doctor-scrub-staging" | ".doctor-scrub-progress"
+            )
+    })
+}
+
+fn is_legacy_audit_generation(suffix: &str) -> bool {
+    if suffix.is_empty() {
+        return true;
+    }
+    let Some(generation) = suffix.strip_prefix('.') else {
+        return false;
+    };
+    matches!(generation.as_bytes().first(), Some(b'1'..=b'9'))
+        && generation.bytes().all(|byte| byte.is_ascii_digit())
+        && (generation.len() > 1 || generation != "1")
+}
+
+#[derive(Clone, Copy)]
+enum PluginPathRelocation<'a> {
+    Imported,
+    Cloned {
+        source: &'a EnvPaths,
+        target: &'a EnvPaths,
+    },
+}
+
+pub(super) fn relocate_cloned_plugin_index_paths(
+    source: &EnvPaths,
+    target: &EnvPaths,
+) -> Result<MigratedRuntimeStateResult, String> {
+    relocate_installed_plugin_index_paths(
+        &target.state_dir.join("state/openclaw.sqlite"),
+        &source.state_dir,
+        &target.state_dir,
+        PluginPathRelocation::Cloned { source, target },
+    )
+}
+
+pub(super) fn clear_cloned_agent_database_leases(target: &EnvPaths) -> Result<(), String> {
+    let Some(database_path) = contained_imported_database(
+        &target.state_dir.join("state/openclaw.sqlite"),
+        &target.root,
+    )?
+    else {
+        return Ok(());
+    };
+    if !is_sqlite_database(&database_path)? {
+        return Ok(());
+    }
+    let connection = Connection::open(&database_path).map_err(|error| error.to_string())?;
+    let has_leases = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'agent_database_leases')",
+        [],
+        |row| row.get::<_, bool>(0),
+    ).map_err(|error| error.to_string())?;
+    if has_leases {
+        // Only a new independent clone loses these source-process claims.
+        // Shared repair/import/restore cleanup must preserve its own live owners.
+        connection
+            .execute("DELETE FROM agent_database_leases", [])
+            .map_err(|error| format!("failed to clear cloned agent database leases: {error}"))?;
+    }
+    Ok(())
+}
+
 fn relocate_installed_plugin_index_paths(
     database_path: &Path,
     source_state_root: &Path,
     target_state_root: &Path,
+    relocation: PluginPathRelocation<'_>,
 ) -> Result<MigratedRuntimeStateResult, String> {
-    let Some(database_path) = contained_imported_database(database_path, target_state_root)? else {
+    let database_root = match relocation {
+        PluginPathRelocation::Imported => target_state_root,
+        PluginPathRelocation::Cloned { target, .. } => &target.root,
+    };
+    let Some(database_path) = contained_imported_database(database_path, database_root)? else {
         return Ok(MigratedRuntimeStateResult::default());
     };
     if !is_sqlite_database(&database_path)? {
@@ -340,16 +463,26 @@ fn relocate_installed_plugin_index_paths(
             )
         })?
         .is_some();
-    if !table_exists {
-        return Ok(MigratedRuntimeStateResult::default());
-    }
+    let (select_sql, update_sql) = if table_exists {
+        (
+            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
+            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
+        )
+    } else {
+        let machine_state_exists = connection
+            .query_row("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'config_machine_state'", [], |_| Ok(()))
+            .optional().map_err(|error| error.to_string())?.is_some();
+        if !machine_state_exists {
+            return Ok(MigratedRuntimeStateResult::default());
+        }
+        (
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            "UPDATE config_machine_state SET value_json = ?1 WHERE state_key = 'plugins.installedIndex'",
+        )
+    };
 
     let Some(raw_records) = connection
-        .query_row(
-            "SELECT install_records_json FROM installed_plugin_index WHERE index_key = 'installed-plugin-index'",
-            [],
-            |row| row.get::<_, String>(0),
-        )
+        .query_row(select_sql, [], |row| row.get::<_, String>(0))
         .optional()
         .map_err(|error| {
             format!(
@@ -361,13 +494,21 @@ fn relocate_installed_plugin_index_paths(
         return Ok(MigratedRuntimeStateResult::default());
     };
 
-    let mut records: Value = serde_json::from_str(&raw_records).map_err(|error| {
+    let mut document: Value = serde_json::from_str(&raw_records).map_err(|error| {
         format!(
             "failed to parse imported OpenClaw plugin install records {}: {error}",
             display_path(&database_path)
         )
     })?;
-    let Some(records) = records.as_object_mut() else {
+    let records = if table_exists {
+        document.as_object_mut()
+    } else {
+        document
+            .get_mut("index")
+            .and_then(|index| index.get_mut("installRecords"))
+            .and_then(Value::as_object_mut)
+    };
+    let Some(records) = records else {
         return Err(format!(
             "imported OpenClaw plugin install records are not an object: {}",
             display_path(&database_path)
@@ -380,6 +521,15 @@ fn relocate_installed_plugin_index_paths(
         let Some(record) = record.as_object_mut() else {
             continue;
         };
+        if let PluginPathRelocation::Cloned { source, target } = relocation {
+            match relocate_cloned_plugin_record(record, source, target) {
+                Some(record_changed) => changed |= record_changed,
+                None => {
+                    external_plugin_ids.insert(plugin_id.clone());
+                }
+            }
+            continue;
+        }
         let is_path_plugin = record.get("source").and_then(Value::as_str) == Some("path");
         let mut has_external_path = false;
         for field in ["installPath", "sourcePath"] {
@@ -419,10 +569,7 @@ fn relocate_installed_plugin_index_paths(
     }
 
     connection
-        .execute(
-            "UPDATE installed_plugin_index SET install_records_json = ?1 WHERE index_key = 'installed-plugin-index'",
-            [Value::Object(records.clone()).to_string()],
-        )
+        .execute(update_sql, [document.to_string()])
         .map_err(|error| {
             format!(
                 "failed to relocate imported OpenClaw plugin install records {}: {error}",
@@ -433,6 +580,121 @@ fn relocate_installed_plugin_index_paths(
         changed: true,
         external_plugin_ids: external_plugin_ids.into_iter().collect(),
     })
+}
+
+fn relocate_cloned_plugin_record(
+    record: &mut serde_json::Map<String, Value>,
+    source_paths: &EnvPaths,
+    target_paths: &EnvPaths,
+) -> Option<bool> {
+    let path = |field| {
+        record
+            .get(field)
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(PathBuf::from)
+    };
+    let install_path = path("installPath");
+    let source_path = path("sourcePath");
+    let is_path_plugin = record.get("source").and_then(Value::as_str) == Some("path");
+    let mut changed = false;
+    let relocated_install = match install_path.as_deref() {
+        Some(path) => Some(cloned_plugin_path(
+            path,
+            source_paths,
+            target_paths,
+            !is_path_plugin,
+        )?),
+        None => None,
+    };
+    if let Some(install) = relocated_install.as_ref() {
+        let value = Value::String(display_path(install));
+        changed |= record.get("installPath") != Some(&value);
+        record.insert("installPath".to_string(), value);
+    }
+    if let Some(source) = source_path.as_deref() {
+        let relocated_source = if let Some(installed_copy) = relocated_install.as_ref() {
+            let install = install_path.as_deref()?;
+            let same_payload = install == source
+                || matches!((fs::canonicalize(install), fs::canonicalize(source)),
+                (Ok(install), Ok(source)) if install == source);
+            if same_payload {
+                // Preserve the equality used to admit linked source entrypoints.
+                installed_copy.clone()
+            } else if let Some(copied_source) =
+                cloned_plugin_path(source, source_paths, target_paths, !is_path_plugin)
+            {
+                copied_source
+            } else {
+                // With an owned preferred installPath, sourcePath is provenance
+                // (a project or archive), not a fallback executable location.
+                // This also holds while that managed install is missing.
+                return Some(changed);
+            }
+        } else {
+            cloned_plugin_path(source, source_paths, target_paths, !is_path_plugin)?
+        };
+        let value = Value::String(display_path(&relocated_source));
+        changed |= record.get("sourcePath") != Some(&value);
+        record.insert("sourcePath".to_string(), value);
+    }
+    Some(changed)
+}
+
+fn cloned_plugin_path(
+    path: &Path,
+    source: &EnvPaths,
+    target: &EnvPaths,
+    allow_copied_gateway_path: bool,
+) -> Option<PathBuf> {
+    if !path.is_absolute() {
+        return None;
+    }
+    let (relative, target_base, check_source) =
+        if let Ok(relative) = path.strip_prefix(&source.root) {
+            (relative.to_path_buf(), &target.root, true)
+        } else if let Ok(relative) = path.strip_prefix(&target.root) {
+            (relative.to_path_buf(), &target.root, false)
+        } else if let Some(relative) = existing_plugin_relative(path, &source.root) {
+            // Config rewriting also accepts existing aliases of copied env-owned
+            // files. Canonicalization here deliberately requires the payload to exist.
+            (relative, &target.root, false)
+        } else {
+            // An old gateway prefix is evidence only when the corresponding copied
+            // payload really exists. Missing-path support must not widen this case.
+            (
+                relocatable_plugin_path(path, &source.state_dir, allow_copied_gateway_path)?,
+                &target.state_dir,
+                false,
+            )
+        };
+    if relative
+        .components()
+        .any(|part| !matches!(part, Component::CurDir | Component::Normal(_)))
+    {
+        return None;
+    }
+    if check_source && !contained_plugin_path(path, &source.root) {
+        return None;
+    }
+    let copied = target_base.join(relative);
+    contained_plugin_path(&copied, &target.root).then_some(copied)
+}
+
+fn existing_plugin_relative(path: &Path, root: &Path) -> Option<PathBuf> {
+    let root = fs::canonicalize(root).ok()?;
+    let path = fs::canonicalize(path).ok()?;
+    path.strip_prefix(root).ok().map(Path::to_path_buf)
+}
+
+fn contained_plugin_path(path: &Path, root: &Path) -> bool {
+    let Ok(root) = fs::canonicalize(root) else {
+        return false;
+    };
+    let Ok((projected, _)) = super::dev_registration::registration_path(path) else {
+        return false;
+    };
+    super::dev_sources::projected_path_contains(&root, &projected).unwrap_or(false)
 }
 
 fn contained_imported_database(
@@ -510,6 +772,7 @@ fn is_sqlite_database(path: &Path) -> Result<bool, String> {
 }
 
 fn clear_volatile_runtime_state(
+    state_root: &Path,
     root: &Path,
     config_path: &Path,
     workspaces: &OpenClawWorkspaceInventory,
@@ -523,13 +786,16 @@ fn clear_volatile_runtime_state(
     for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let path = entry.path();
-        if path == config_path || workspaces.contains(&path) {
+        if path == config_path
+            || workspaces.contains(&path)
+            || is_integrity_protected_history_path(state_root, &path)
+        {
             continue;
         }
 
         let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
         if metadata.is_dir() && workspaces.has_descendant(&path) {
-            changed |= clear_volatile_runtime_state(&path, config_path, workspaces)?;
+            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
             continue;
         }
         let file_name = entry.file_name();
@@ -540,7 +806,7 @@ fn clear_volatile_runtime_state(
         }
 
         if metadata.is_dir() {
-            changed |= clear_volatile_runtime_state(&path, config_path, workspaces)?;
+            changed |= clear_volatile_runtime_state(state_root, &path, config_path, workspaces)?;
         }
     }
 
@@ -778,6 +1044,9 @@ fn collect_runtime_state_path_refs(
         &paths.config_path,
         workspaces,
         &mut |path| {
+            if is_integrity_protected_history_path(&paths.state_dir, path) {
+                return;
+            }
             let Ok(raw) = fs::read_to_string(path) else {
                 return;
             };
@@ -934,6 +1203,21 @@ mod tests {
         let _ = fs::remove_dir_all(&temp);
         let source_root = temp.join("source");
         let target_root = temp.join("target");
+        let current = meta("target", &display_path(&target_root));
+        let known_envs = vec![meta("source", &display_path(&source_root)), current.clone()];
+        fs::create_dir_all(target_root.join(".openclaw/logs")).unwrap();
+        fs::write(
+            target_root.join(".openclaw/logs/config-audit.jsonl.migrated"),
+            format!(
+                "{}\n",
+                source_root.join(".openclaw/openclaw.json").display()
+            ),
+        )
+        .unwrap();
+        let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
+        assert!(!audit.repair_runtime_state);
+        assert!(audit.issues.is_empty());
+
         fs::create_dir_all(target_root.join(".openclaw/agents/main/sessions")).unwrap();
         fs::write(
             target_root.join(".openclaw/agents/main/sessions/main.jsonl"),
@@ -944,8 +1228,6 @@ mod tests {
         )
         .unwrap();
 
-        let current = meta("target", &display_path(&target_root));
-        let known_envs = vec![meta("source", &display_path(&source_root)), current.clone()];
         let audit = audit_openclaw_state(&current, &known_envs, &BTreeMap::new());
         assert!(audit.repair_runtime_state);
         assert!(audit.issues.iter().any(|issue| issue.contains(

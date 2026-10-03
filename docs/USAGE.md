@@ -491,6 +491,85 @@ ocm upgrade mira
 This is the normal command when `mira` tracks a channel like `stable` or `beta`.
 Use `--dry-run` to preview the transaction without writing snapshots, runtimes, envs, or services.
 
+In `--json` output, `runtimeReleaseVersion` and `runtimeReleaseChannel` describe
+the resolved target even when preparation fails or the upgrade rolls back.
+The version includes a named runtime's detected version; the channel remains
+`null` when the selected runtime's channel is unknown.
+
+On Linux and macOS, a no-target upgrade can update a recognized `pnpm openclaw` or `node <checkout>/openclaw.mjs` checkout in place while keeping its launcher binding.
+On Unix, literal single- or double-quoted paths can contain spaces, including aliases to a source checkout.
+Quoted characters such as `#` and `&` are recognized as path data, and single quotes also preserve literal `$` and backtick characters.
+Backslashes outside single quotes, active substitutions, and unquoted shell operators remain opaque.
+Recognizing literal words for inspection does not change how launcher commands execute.
+This requires native source artifact observations from `openclaw update status --json`; older checkouts without that observation remain `local-command`, with support reported as unknown.
+OCM refuses dirty or unverified checkout status, known shared users, and active or unresolved foreground source ownership before source mutation.
+Source execution also refuses assume-unchanged or skip-worktree index entries, which can hide modified tracked files from ordinary Git status.
+Native update activity or unresolved run status must also be settled before OCM captures a checkpoint or changes the service.
+A no-op requires a current target and verified native artifacts; a running service also requires matching Gateway readiness, build identity, and applied launch settings.
+This leaves configuration and service untouched.
+Development source requires a freshly checked `main` upstream; configured stable or beta source requires the native `preferredTarget` observation, including its channel and commit.
+Missing target observations remain unknown and cannot establish this shortcut.
+Otherwise, OCM captures an environment checkpoint, stops its managed service, and invokes the public native `update --no-restart` command with external service repair policy.
+Native OpenClaw owns source selection, staging, builds, Doctor, and source recovery; OCM restores its prior service policy only after verification.
+Post-update and recovery verification prefer fresh local artifact observations from ordinary OpenClaw status.
+When that command cannot supply complete observations, such as for an unconfigured environment, verification uses native update status and can still wait for remote discovery.
+An observed wrong installation or unready build remains a verification failure.
+Binding changes, service-policy writes, and new foreground source admission wait while the native source operation holds registry exclusion; environment and job-status reads remain available.
+Source preparation also refuses while an overlapping source environment is completing an operation, including service activation and recovery.
+Successful source execution records `source-updated`, which cannot be selected by `upgrade rollback`, including in older OCM readers.
+If recording history fails after source and Gateway verification, the operation reports `failed` with a history-incomplete note and retains the checkpoint; the verified source and service remain in place.
+An interrupt before completion still follows the existing source recovery policy.
+The checkpoint contains environment state, not the previous source bytes, so OCM never replays it over an unverified source runtime.
+When native recovery cannot prove compatible software and state, the report retains the checkpoint and identifies unresolved recovery or service shutdown instead of claiming restoration.
+Inspect the native recovery report before restarting through OCM.
+After forcibly terminating the native updater, inspect its run and process state before changing source bindings or restarting the checkout.
+Source execution rejects `--no-rollback` because that flag cannot disable native recovery; explicit runtime, version, and channel conversions retain their existing behavior.
+Job capabilities describe the recognized source command route without executing OpenClaw or testing current eligibility, so status remains readable throughout an update and recovery.
+Source `--dry-run` remains local inspection without executing OpenClaw or probing remote update support.
+JSON includes `source` only for recognized source launchers, with the canonical `root`, Git `head`, `builtCommit` and `builtVersion` from `dist/build-info.json`, and nullable `buildMatchesHead` and `workingTreeClean` observations.
+A different built commit reveals source that has moved without a matching build; a matching commit alone does not prove a complete build, healthy dependencies, or the identity of a running Gateway.
+Missing or invalid metadata remains unknown and is explained in `issues`.
+Working-tree cleanliness also remains unknown when Git filters or submodules prevent inspection without potentially executing configured commands.
+Staged submodule removals and replacements remain visible as dirty when no submodule remains in the index; inspection does not scan nested worktrees.
+Working-tree cleanliness remains unknown for repositories with partial-clone or promisor-remote configuration, because Git can fetch missing objects while checking status, including on older versions that ignore lazy-fetch safeguards.
+Locally recorded HEAD and tracking information remain available without loading those objects.
+`trackingRef` and `trackingHead` describe locally recorded Git tracking information, which may be stale; inspection does not fetch or contact a remote.
+`sharedEnvironments` lists other registered launcher, dev, or runtime bindings whose known paths overlap the checkout, including path aliases.
+An empty list does not establish exclusive ownership or exclude unmanaged processes.
+Opaque shell launchers retain their existing report without inferred source facts.
+
+An unavailable optional candidate Doctor check is a compatibility exception only when it is the sole failure, including when native Doctor repeats that same finding on stderr during an update.
+This preserves upgrades when the selected plugin check is disabled or absent from an older runtime.
+Mixed failures, malformed responses, and additional or contradictory diagnostics stop the upgrade before finalization and binding publication.
+
+When candidate validation fails, the report keeps bounded, redacted Doctor
+findings and identifies candidate-provided hints as information captured before
+recovery. OCM's recovery guidance describes the current environment binding and
+whether the failed candidate was retained, removed, or replaced by the previous
+runtime. With `--no-rollback`, completed target configuration repairs remain in
+the environment. Per-environment upgrade history records only cleanup diagnostics,
+excluding general child output. Fleet batch journals retain the same bounded,
+redacted result notes shown by the batch command.
+
+If automatic rollback or recovery from a failed explicit rollback cannot finish, OCM preserves the previous managed runtime files along with the existing safety snapshot.
+The result remains `rollback-failed` and prints the retained file location; it does not certify restored configuration, runtime, or service health.
+Inspect `ocm upgrade history <env> --json` for the transaction's snapshot and runtime recovery metadata.
+If writing recovery metadata also failed, preserve the original backup location printed in the command result.
+Keep the snapshot and retained files until operator recovery is complete, because snapshot removal also removes linked runtime recovery.
+Automatic recovery after abrupt process loss is not provided by this retention behavior.
+
+On Linux and macOS, upgrade commands keep the environment mutation lock in their native version probes, Doctor, finalizer, completion-cache, and final Gateway-status verification children.
+Version probes retain the lock during upgrade preflight, final verification, and rollback because configured Node preloads and launcher arguments can run before the version fast path.
+The same protection applies to final Gateway-status verification after an explicit rollback, because native diagnostic startup and exit can write environment state even for status queries.
+If the OCM parent is killed, competing environment mutations and upgrades wait until those children close the inherited lock or exit.
+Each fleet child retains only its own environment's lock.
+This is not crash recovery or proof that all descendants stopped: a program can close inherited descriptors before spawning further work, and Windows retains its existing locking behavior.
+
+If a later mutation keeps waiting, use `lsof "${OCM_HOME:-$HOME/.ocm}/locks/environments/mira.lock"` to inspect processes with that environment's lock file open.
+Distinguish waiting OCM commands from surviving upgrade children, and let active update work finish.
+Stop an unintended holder only after verifying that interrupting its work is safe, then retry the mutation.
+Do not delete or replace the lock file to bypass a holder: a new file can admit another writer while the original holder is still running.
+
 ### Upgrade every environment that can be updated safely
 
 ```bash
@@ -518,8 +597,20 @@ ocm self update --check
 
 ## Environment lifecycle
 
-Environment creation, including `start` and migration, and `env clone` and
-`env import` require a root outside registered dev sources. Missing borrowed
+New environment roots must be separate. A root cannot equal, contain, or sit
+inside another registered environment root, including through path aliases.
+OCM rejects overlap before creating or copying environment state or registering
+the new environment, regardless of protection flags. Default sibling roots and
+disjoint custom roots remain valid. This applies to `env create`, `env clone`,
+`env import`, and new environments created by `start`, `setup`, `dev`, `migrate`,
+`adopt import`, or upgrade simulation.
+
+A registered root remains reserved while its directory is missing. Disjoint
+Unicode roots remain valid; case and normalization aliases of a missing root
+are still reserved. On Windows, an ambiguous missing 8.3 short name requires
+restoring the registered path before retrying.
+
+These operations also require a root outside registered dev sources. Missing borrowed
 source paths remain reserved until their binding is removed; missing paths of
 OCM-owned worktrees can still be reused. The root must neither contain
 a registered source nor be inside it. OCM resolves source and destination aliases and also protects source
@@ -542,6 +633,68 @@ Clone copies the workspace and env config into a new environment, gives the clon
 ocm start rowan
 ```
 
+Registered managed plugins use the clone's installed files. Local project and
+archive paths can remain as source information once the installed payload's
+location is proved to belong to the clone. Missing managed payloads stay missing,
+with their install records rebased onto the target for diagnosis or repair.
+Active plugin paths and copied databases must remain inside the cloned environment;
+locations that escape through external paths or symlinks are rejected before publication. The
+same plugin isolation applies to upgrade simulation clones.
+
+### Asynchronous upgrades
+
+On Unix, an explicit operator request can run the ordinary environment upgrade in a detached OCM worker.
+No extra permanent service is installed.
+
+A job returns `up-to-date` without a checkpoint or restart when the requested package and binding are already current, package integrity and native configuration checks pass, and any running managed Gateway reports the same healthy build and the daemon confirms its actual launch specification matches the current desired settings.
+Unknown build or launch identity, configuration needing repair, changed launch settings, and unhealthy or mismatched serving state keep the ordinary checkpointed upgrade path.
+Older daemons without launch observations keep that existing behavior.
+When an upgrade resolves an official release, older runtime records without archive integrity use the normal checkpointed install path to establish it.
+Ordinary setup and repeat installation can still reuse a healthy matching legacy runtime, including one already bound to another environment.
+Explicit target or track changes still run the upgrade, and direct managed-runtime `ocm upgrade` commands retain their repair and finalization behavior.
+
+```bash
+ocm upgrade job start mira --json
+ocm upgrade job start mira --runtime tested-build --json
+ocm upgrade job status mira --json
+ocm upgrade job status mira --request-id <id> --json
+```
+
+These commands always return JSON.
+`ocm upgrade job capabilities <env>` reports protocol version 1, platform support, selectors, the current `bindingKind` and `bindingName`, and the environment's root, state directory, and config path.
+On Unix, supervised Gateways receive the spawning daemon's executable in `OCM_SELF` alongside their existing OCM environment identity; clients query capabilities to determine upgrade-job support.
+Clients must use their trusted OCM executable and environment binding, and preserve their own requester authorization before submitting an operation.
+Latest status returns `null` when that environment has no job; an unknown exact request ID is an error.
+`start --request-id <id>` lets a caller choose a correlation ID before submission; repeating the same ID and target returns that existing job without replaying it.
+Reusing an ID for a different target or a recreated environment is refused.
+Clients acting on an observed binding can pass `start --if-binding <kind>:<name>`, copying `bindingKind` and `bindingName` from capabilities.
+OCM rejects a mismatched new request before recording it and rechecks the condition under the environment operation lock before runtime or service I/O.
+If the binding changes after admission while the worker waits, the accepted job fails without changing the binding, runtime, service, or upgrade history.
+Repeating an accepted request with the same ID, target, and binding condition returns its original job even if that binding has since changed; changing the condition for that ID is refused.
+Without `--if-binding`, explicit operator selectors retain their ordinary behavior, including conversion from a launcher to a packaged runtime.
+Guarded requests use job-record version 2 so older workers refuse them instead of ignoring the condition; unguarded records retain version 1.
+Latest status excludes completed jobs from an older environment instance; an exact ID still retrieves its original historical result.
+An active prior-instance worker still blocks new jobs, and latest status reports that blocker with its exact request ID.
+`start` accepts the same mutually exclusive `--version`, `--channel`, or `--runtime` selectors as a single-environment upgrade, with rollback enabled.
+It returns only after the worker accepts the request, and the worker starts upgrade work after the response is written.
+Existing environment and upgrade transaction locks still exclude conflicting mutations.
+The worker verifies the admitted environment root and creation identity under the operation lock, before runtime or service I/O, and refuses a same-name replacement.
+A second asynchronous request for the same environment is refused while the first is active.
+
+Each response includes `id`, `envName`, `state`, `progress`, a monotonic `revision`, `createdAt`, a persisted `updatedAt` advancing at least one millisecond per revision, the requested `target`, and optional `result` or `error`.
+The terminal `result` is the ordinary upgrade summary, including its precise `outcome`, target version, snapshot, and rollback facts.
+A successful job can report an unchanged or skipped outcome; success alone does not mean a new release was installed.
+A failed upgrade or completed rollback is reported as `failed`, with the original result preserved.
+Request records live under the environment's upgrade-history directory and remain queryable by their original ID after later submissions.
+
+If the worker disappears without recording a result, status reports `interrupted` and recovery remains unresolved.
+That request is terminal and is never replayed.
+After inspecting or repairing the environment and its recovery state, an operator may explicitly submit a fresh request ID through the ordinary upgrade checks and locks.
+Known native writers that outlive the old worker retain environment exclusion, so the fresh operation waits for them to finish.
+A fresh request does not resume the old transaction or change its recorded result.
+An interrupted job does not establish that rollback succeeded or that retrying is safe.
+This command is an explicit local operator action; it does not supply authorization revalidation for a remote requester or UI client.
+
 ### Upgrade checkpoint scope
 
 By default, upgrade and rollback safety checkpoints cover the full environment.
@@ -550,13 +703,26 @@ their directories before the upgrade:
 
 ```bash
 ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/workspace/worktrees
+# Include separately located managed worktrees and a development checkout:
+ocm env set-independent-paths mira .openclaw/workspace/projects .openclaw/worktrees development/checkouts
 ocm env show mira --json
 ocm env set-independent-paths mira none
 ```
 
-The command replaces the list. Paths are relative to the environment root, must
-be strictly beneath a configured workspace, and must name directories. A declared
-directory may be absent if its parents exist. Parents must be real directories;
+The command replaces the list. Paths are relative to the environment root and
+must name directories in one of these locations:
+
+- strictly beneath a configured workspace;
+- the managed-worktree content directory `.openclaw/worktrees`, or beneath it;
+- a non-hidden top-level directory of the environment home, or beneath it.
+
+Other hidden home/state directories remain ineligible. For example, `.openclaw/agents`,
+`.openclaw/credentials`, `.openclaw/state`, and `.codex` cannot be excluded. The
+managed-worktree registry and migration state remain in the state database, not
+in the excluded checkout contents. These locations are eligibility rules only:
+no content is excluded without an explicit declaration.
+
+A declared directory may be absent if its parents exist. Parents must be real directories;
 symlinks within an independent directory remain untouched. Individual files cannot
 be declared independently, keeping SQLite databases and their adjacent WAL and
 journal files together. Paths cannot overlap, escape the environment, contain
@@ -693,6 +859,11 @@ ocm env import ./mira.tar --name rowan
 ```
 
 Imported environments get a fresh identity, have env-scoped OpenClaw config rewritten for the new root, and keep durable agent settings while clearing copied runtime residue like sessions, logs, and backup files.
+
+Environment archives must contain real `meta/` and `root/` directories and a
+regular `meta/env.json` file. Import and legacy snapshot restore reject symlinks
+at those entries before reading metadata or copying environment contents, so
+an archive cannot redirect those operations to files outside its extracted tree.
 
 ### Inspect and repair
 
@@ -918,6 +1089,11 @@ Background services:
 - Linux uses `systemd --user`
 
 Windows service support is not implemented yet.
+
+On macOS, service ownership is read from `EnvironmentVariables.OCM_HOME` in
+the LaunchAgent plist. Plist-aware editors can reformat the definition or
+convert it to binary without changing ownership. A different, missing, or
+invalid owner still prevents OCM from replacing or controlling that service.
 
 ## Safety notes
 

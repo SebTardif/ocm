@@ -1,5 +1,8 @@
-use std::collections::{BTreeSet, VecDeque};
+mod job;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::fmt;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -12,6 +15,11 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+
+mod diagnostics;
+pub(super) mod source;
+mod source_update;
+use diagnostics::{CandidateFailure, CandidateFailureKind};
 
 use super::{Cli, render};
 use crate::env::{
@@ -26,15 +34,16 @@ use crate::runtime::releases::{
 };
 use crate::runtime::{
     InstallRuntimeFromOfficialReleaseOptions, OfficialRuntimePrepareAction, RuntimeMeta,
-    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, resolve_runtime_launch,
+    RuntimeReleaseSelectorKind, RuntimeService, StagedRuntimeInstall, is_openclaw_package_runtime,
+    resolve_runtime_launch,
 };
 use crate::service::{ServiceSummary, wait_for_gateway_readiness};
 use crate::store::{
-    InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding, UpgradeHistoryPhaseTiming,
-    UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery, UpgradeHistoryServiceState,
-    UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path, copy_dir_recursive, derive_env_paths,
-    display_path, ensure_minimum_local_openclaw_config, ensure_store, get_runtime,
-    get_upgrade_history_record, get_upgrade_runtime_recovery,
+    EnvironmentOperationLock, InstallContext, RuntimeReleaseDetails, UpgradeHistoryBinding,
+    UpgradeHistoryPhaseTiming, UpgradeHistoryRecord, UpgradeHistoryRuntimeRecovery,
+    UpgradeHistoryServiceState, UpgradeHistoryStage, UpgradeRuntimeRecovery, clean_path,
+    copy_dir_recursive, derive_env_paths, display_path, ensure_minimum_local_openclaw_config,
+    ensure_store, get_runtime, get_upgrade_history_record, get_upgrade_runtime_recovery,
     install_runtime_from_selected_official_openclaw_release, list_upgrade_history,
     lock_env_registry, lock_upgrade_batch, lock_upgrade_participant, lock_upgrade_transaction,
     remove_runtime, remove_upgrade_recovery, resolve_absolute_path, runtime_install_root,
@@ -144,6 +153,8 @@ const UPGRADE_INTERRUPTED_ERROR: &str =
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UpgradeEnvSummary {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<source::SourceInspection>,
     pub env_name: String,
     pub previous_binding_kind: String,
     pub previous_binding_name: String,
@@ -255,7 +266,7 @@ pub(crate) struct UpgradeSimulationBatchSummary {
     pub results: Vec<UpgradeSimulationSummary>,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, serde::Deserialize)]
 struct UpgradeTarget {
     version: Option<String>,
     channel: Option<String>,
@@ -489,10 +500,6 @@ impl UpgradeTarget {
         )
     }
 
-    fn release_channel_hint(&self) -> Option<String> {
-        self.channel.clone()
-    }
-
     fn is_named_runtime(&self) -> bool {
         self.runtime.is_some()
     }
@@ -539,6 +546,9 @@ impl Cli {
     }
 
     pub(super) fn handle_upgrade_command(&self, args: Vec<String>) -> Result<i32, String> {
+        if args.first().map(String::as_str) == Some("job") {
+            return self.handle_upgrade_job(args[1..].to_vec());
+        }
         let (args, json_flag, profile) = self.consume_human_output_flags(args, "upgrade")?;
         if matches!(args.first().map(String::as_str), Some("batch")) {
             return self.handle_upgrade_batch(args[1..].to_vec(), json_flag, profile);
@@ -612,6 +622,7 @@ impl Cli {
                 match self.upgrade_env(&env.name, &target, options) {
                     Ok(summary) => results.push(summary),
                     Err(error) => results.push(UpgradeEnvSummary {
+                        source: None,
                         env_name: env.name,
                         previous_binding_kind: "unknown".to_string(),
                         previous_binding_name: "—".to_string(),
@@ -709,10 +720,13 @@ impl Cli {
         let mut lock_names = options.env_names.clone();
         lock_names.sort();
         let mut transaction_locks = Vec::with_capacity(lock_names.len());
-        let mut operation_locks = Vec::with_capacity(lock_names.len());
+        let mut operation_locks = BTreeMap::new();
         for env_name in &lock_names {
             transaction_locks.push(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?);
-            operation_locks.push(self.environment_service().lock_operation(env_name)?);
+            operation_locks.insert(
+                env_name.clone(),
+                self.environment_service().lock_operation(env_name)?,
+            );
             if !options.dry_run {
                 self.environment_service()
                     .ensure_source_watch_allows_state_mutation_locked(env_name)?;
@@ -729,7 +743,12 @@ impl Cli {
         };
         let mut preflight = Vec::with_capacity(options.env_names.len());
         for env_name in &options.env_names {
-            let result = self.upgrade_env_locked(env_name, &target, preflight_options)?;
+            let result = self.upgrade_env_locked(
+                env_name,
+                &target,
+                preflight_options,
+                &operation_locks[env_name],
+            )?;
             if is_failed_upgrade_outcome(&result.outcome) {
                 return Err(format!(
                     "upgrade batch preflight failed for env \"{env_name}\": {}",
@@ -828,6 +847,8 @@ impl Cli {
         summary.outcome = "snapshotted".to_string();
         self.save_upgrade_batch_journal(&journal_path, &summary)?;
 
+        let operation_locks = Arc::new(operation_locks);
+        let worker_operation_locks = Arc::clone(&operation_locks);
         let target_for_workers = target.clone();
         let failure_policy = options.failure_policy;
         let upgrade_results = self.run_parallel_batch_work(
@@ -841,6 +862,7 @@ impl Cli {
                         dry_run: false,
                         rollback_enabled: failure_policy == UpgradeFleetFailurePolicy::Rollback,
                     },
+                    &worker_operation_locks[env_name],
                 );
                 match result {
                     Ok(mut result)
@@ -856,7 +878,11 @@ impl Cli {
                                 "failed to leave the gateway stopped for external recovery: {error}"
                             ),
                         };
-                        result.note = join_optional_warnings(result.note, Some(stop_note));
+                        let note = match result.note.take() {
+                            Some(diagnostic) => format!("{diagnostic}\n{stop_note}"),
+                            None => stop_note,
+                        };
+                        result.note = crate::infra::command_output::bounded_summary(note.lines());
                         Ok(result)
                     }
                     other => other,
@@ -1121,7 +1147,7 @@ impl Cli {
         } else {
             Some(lock_upgrade_transaction(env_name, &self.env, &self.cwd)?)
         };
-        let _operation_lock = if dry_run {
+        let operation_lock = if dry_run {
             None
         } else {
             Some(self.environment_service().lock_operation(env_name)?)
@@ -1130,8 +1156,9 @@ impl Cli {
             self.environment_service()
                 .ensure_source_watch_allows_state_mutation_locked(env_name)?;
         }
-        let plan = self.prepare_upgrade_rollback(env_name, transaction_id)?;
-        if dry_run {
+        let plan =
+            self.prepare_upgrade_rollback(env_name, transaction_id, operation_lock.as_ref())?;
+        let Some(operation_lock) = operation_lock.as_ref() else {
             return Ok(UpgradeRollbackSummary {
                 env_name: env_name.to_string(),
                 transaction_id: plan.record.id.clone(),
@@ -1149,15 +1176,16 @@ impl Cli {
                     "dry run: no runtime, env, service, snapshot, or history changed".to_string(),
                 ),
             });
-        }
+        };
 
-        self.execute_upgrade_rollback_locked(env_name, plan)
+        self.execute_upgrade_rollback_locked(env_name, plan, operation_lock)
     }
 
     fn prepare_upgrade_rollback(
         &self,
         env_name: &str,
         transaction_id: Option<&str>,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<UpgradeRollbackPlan, String> {
         let history = list_upgrade_history(env_name, &self.env, &self.cwd)?;
         let record = match transaction_id {
@@ -1223,8 +1251,8 @@ impl Cli {
             .ensure_snapshot_restore_preserves_dev_sources_locked(&snapshot)?;
         self.environment_service()
             .ensure_upgrade_rollback_preserves_dev_sources_locked(&current)?;
-        self.verify_rollback_target_version(env_name, &record)?;
-        let recovery = self.verify_rollback_source(env_name, &record)?;
+        self.verify_rollback_target_version(env_name, &record, operation_lock)?;
+        let recovery = self.verify_rollback_source(env_name, &record, operation_lock)?;
         Ok(UpgradeRollbackPlan { record, recovery })
     }
 
@@ -1232,12 +1260,17 @@ impl Cli {
         &self,
         env_name: &str,
         record: &UpgradeHistoryRecord,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<(), String> {
         let Some(expected_version) = record.target.openclaw_version.as_deref() else {
             return Ok(());
         };
-        let version =
-            self.run_openclaw_command(env_name, "current openclaw --version", &["--version"])?;
+        let version = self.run_openclaw_command(
+            env_name,
+            "current openclaw --version",
+            &["--version"],
+            operation_lock,
+        )?;
         if version_output_matches_expected(version.first_line().trim(), expected_version) {
             return Ok(());
         }
@@ -1253,6 +1286,7 @@ impl Cli {
         &self,
         env_name: &str,
         record: &UpgradeHistoryRecord,
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<Option<UpgradeRuntimeRecovery>, String> {
         match record.source.kind.as_str() {
             "runtime" => {
@@ -1328,6 +1362,7 @@ impl Cli {
                         &record.source.name,
                         "rollback source openclaw --version",
                         &["--version"],
+                        operation_lock,
                     )?;
                     if !version.status.success()
                         || !version_output_matches_expected(
@@ -1349,6 +1384,7 @@ impl Cli {
                     &record.source.name,
                     "rollback source openclaw --version",
                     &["--version"],
+                    operation_lock,
                 )?;
                 if !version.status.success() {
                     return Err(format!(
@@ -1382,6 +1418,7 @@ impl Cli {
         &self,
         env_name: &str,
         plan: UpgradeRollbackPlan,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeRollbackSummary, String> {
         let runtime_names = plan
             .recovery
@@ -1461,6 +1498,7 @@ impl Cli {
             env_name,
             plan.record.source.openclaw_version.as_deref(),
             plan.record.service_before.running,
+            operation_lock,
         ) {
             Ok(note) => note,
             Err(error) => {
@@ -1485,6 +1523,7 @@ impl Cli {
         transaction.mark_post_update_not_needed();
 
         let history_summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: plan.record.target.kind.clone(),
             previous_binding_name: plan.record.target.name.clone(),
@@ -1585,7 +1624,7 @@ impl Cli {
     ) -> UpgradeRollbackSummary {
         let rollback_transaction_id = transaction.id.clone();
         let safety_snapshot_id = transaction.snapshot_id.clone();
-        let restore_result = self.rollback_upgrade_locked(env_name, &transaction);
+        let restore_result = self.rollback_upgrade_locked(env_name, &mut transaction);
         if let Ok(cleanup_note) = &restore_result {
             transaction.cleanup_note = cleanup_note.clone();
         }
@@ -1610,7 +1649,16 @@ impl Cli {
                 ),
             ),
         };
+        let recovery_note = if restored_pre_rollback_state {
+            None
+        } else {
+            self.retain_unresolved_runtime_recovery(env_name, &mut transaction)
+        };
+        transaction.cleanup_note =
+            join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
+        let note = join_optional_warnings(Some(note), recovery_note).unwrap();
         let history_summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: plan.record.target.kind.clone(),
             previous_binding_name: plan.record.target.name.clone(),
@@ -1655,7 +1703,7 @@ impl Cli {
         } else {
             None
         };
-        transaction.cleanup();
+        transaction.finish_failed(restored_pre_rollback_state);
 
         UpgradeRollbackSummary {
             env_name: env_name.to_string(),
@@ -2200,6 +2248,15 @@ impl Cli {
         resolved: crate::env::ResolvedExecution,
         extra_env: &[(&str, &str)],
     ) -> Result<SimulationCommandOutput, String> {
+        self.run_resolved_with_operation_lock(resolved, extra_env, None)
+    }
+
+    fn run_resolved_with_operation_lock(
+        &self,
+        resolved: crate::env::ResolvedExecution,
+        extra_env: &[(&str, &str)],
+        operation_lock: Option<&EnvironmentOperationLock>,
+    ) -> Result<SimulationCommandOutput, String> {
         let (mut command, env_meta, source_root, path_prepend) = match resolved {
             crate::env::ResolvedExecution::Launcher {
                 env,
@@ -2259,14 +2316,17 @@ impl Cli {
         for (key, value) in extra_env {
             process_env.insert((*key).to_string(), (*value).to_string());
         }
-        let output = command
+        command
             .env_clear()
             .envs(process_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| format!("failed to run simulation check: {error}"))?;
+            .stderr(Stdio::piped());
+        let output = match operation_lock {
+            Some(lock) => lock.output(command),
+            None => command.output(),
+        }
+        .map_err(|error| format!("failed to run simulation check: {error}"))?;
         Ok(SimulationCommandOutput::from_output(output))
     }
 
@@ -2380,8 +2440,9 @@ impl Cli {
         options: UpgradeOptions,
     ) -> Result<UpgradeEnvSummary, String> {
         let _transaction_lock = lock_upgrade_transaction(name, &self.env, &self.cwd)?;
-        let _operation_lock = self.environment_service().lock_operation(name)?;
-        self.upgrade_env_locked(name, target, options)
+        let operation_lock = self.environment_service().lock_operation(name)?;
+        self.validate_upgrade_job_environment(name)?;
+        self.upgrade_env_locked(name, target, options, &operation_lock)
     }
 
     fn upgrade_env_locked(
@@ -2389,6 +2450,7 @@ impl Cli {
         name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         if !options.dry_run {
             self.environment_service()
@@ -2397,11 +2459,23 @@ impl Cli {
         let env = self.environment_service().get(name)?;
 
         if let Some(runtime_name) = env.default_runtime.as_deref() {
-            return self.upgrade_runtime_bound_env(name, runtime_name, target, options);
+            return self.upgrade_runtime_bound_env(
+                name,
+                runtime_name,
+                target,
+                options,
+                operation_lock,
+            );
         }
 
         if let Some(launcher_name) = env.default_launcher.as_deref() {
-            return self.upgrade_launcher_bound_env(name, launcher_name, target, options);
+            return self.upgrade_launcher_bound_env(
+                name,
+                launcher_name,
+                target,
+                options,
+                operation_lock,
+            );
         }
 
         Err(format!(
@@ -2415,6 +2489,7 @@ impl Cli {
         runtime_name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         let current = self.runtime_service().show(runtime_name)?;
         let previous_binding_name = current.name.clone();
@@ -2422,11 +2497,17 @@ impl Cli {
         if target.is_explicit() {
             let resolved = self.resolve_upgrade_target(target)?;
             let target_runtime_name = resolved.name.clone();
-            let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_version =
+                self.resolved_target_version(env_name, &resolved, operation_lock)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
+            let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
                 current.release_version.as_deref(),
                 target_version.as_deref(),
+                operation_lock,
             )?;
             if !target.is_named_runtime() {
                 self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
@@ -2435,6 +2516,7 @@ impl Cli {
             if options.dry_run {
                 let binding_changed = target_runtime_name != current.name;
                 return Ok(UpgradeEnvSummary {
+                    source: None,
                     env_name: env_name.to_string(),
                     previous_binding_kind: "runtime".to_string(),
                     previous_binding_name,
@@ -2445,8 +2527,8 @@ impl Cli {
                     } else {
                         "would-update".to_string()
                     },
-                    runtime_release_version: target_version.clone(),
-                    runtime_release_channel: resolved.release_channel.clone(),
+                    runtime_release_version: target_release_version.clone(),
+                    runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(
                         service.as_ref(),
                         binding_changed,
@@ -2475,8 +2557,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         error,
                     );
                 }
@@ -2488,6 +2570,17 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
+            if let Some(mut summary) = self.current_runtime_job_result(
+                env_name,
+                &current,
+                &prepared,
+                service.as_ref(),
+                operation_lock,
+            ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
+                return Ok(summary);
+            }
             let target_changed = !matches!(prepared.action, OfficialRuntimePrepareAction::Reused);
             let mut transaction = self.begin_upgrade_transaction_locked(
                 env_name,
@@ -2516,8 +2609,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
-                    target.release_channel_hint(),
+                    target_release_version,
+                    target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
                 );
@@ -2534,36 +2627,39 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         transaction,
                         error,
                     );
                 }
             };
             let binding_changed = prepared.name != current.name;
-            let post_update =
-                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
-                {
-                    Ok(result) => {
-                        transaction.mark_post_update_completed(result.note.as_deref());
-                        result
-                    }
-                    Err(error) => {
-                        transaction.mark_post_update_failed(&error);
-                        return self.rollback_failed_upgrade(
-                            env_name,
-                            "runtime",
-                            previous_binding_name,
-                            "runtime",
-                            prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
-                            transaction,
-                            error,
-                        );
-                    }
-                };
+            let post_update = match self.run_post_core_update(
+                env_name,
+                &prepared.meta,
+                &mut transaction.timings,
+                operation_lock,
+            ) {
+                Ok(result) => {
+                    transaction.mark_post_update_completed(result.note.as_deref());
+                    result
+                }
+                Err(error) => {
+                    transaction.mark_post_update_failed(&error);
+                    return self.rollback_failed_upgrade(
+                        env_name,
+                        "runtime",
+                        previous_binding_name,
+                        "runtime",
+                        prepared.name,
+                        target_release_version,
+                        target_channel,
+                        transaction,
+                        error.to_string(),
+                    );
+                }
+            };
             let post_update_note = post_update.note;
             let completion_deferred = post_update.completion_deferred;
             let publish_started = transaction.timings.start();
@@ -2593,8 +2689,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
                 );
@@ -2615,8 +2711,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2634,12 +2730,14 @@ impl Cli {
                 &prepared.name,
                 completion_deferred,
                 &mut transaction.timings,
+                operation_lock,
             );
             let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
+                operation_lock,
             ) {
                 Ok(note) => {
                     transaction.timings.finish(
@@ -2665,8 +2763,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2681,6 +2779,7 @@ impl Cli {
             );
 
             let summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name,
@@ -2691,8 +2790,8 @@ impl Cli {
                 } else {
                     outcome_for_official_prepare_action(&prepared.action)
                 },
-                runtime_release_version: prepared.meta.release_version.clone(),
-                runtime_release_channel: prepared.meta.release_channel.clone(),
+                runtime_release_version: target_release_version,
+                runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
                 rollback: None,
@@ -2703,6 +2802,7 @@ impl Cli {
 
         if current.source_manifest_url.is_none() {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -2723,6 +2823,7 @@ impl Cli {
 
         if current.release_selector_kind == Some(RuntimeReleaseSelectorKind::Version) {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -2752,22 +2853,29 @@ impl Cli {
             };
             let resolved = self.resolve_upgrade_target(&target)?;
             let target_runtime_name = resolved.name.clone();
-            let target_version = self.resolved_target_version(env_name, &resolved)?;
+            let target_version =
+                self.resolved_target_version(env_name, &resolved, operation_lock)?;
+            let target_release_version = target_version
+                .clone()
+                .or_else(|| resolved.release_version.clone());
+            let target_channel = resolved.release_channel.clone();
             let source_version = self.ensure_upgrade_is_not_downgrade(
                 env_name,
                 current.release_version.as_deref(),
                 target_version.as_deref(),
+                operation_lock,
             )?;
             if options.dry_run {
                 return Ok(UpgradeEnvSummary {
+                    source: None,
                     env_name: env_name.to_string(),
                     previous_binding_kind: "runtime".to_string(),
                     previous_binding_name: previous_binding_name.clone(),
                     binding_kind: "runtime".to_string(),
                     binding_name: target_runtime_name,
                     outcome: "would-update".to_string(),
-                    runtime_release_version: target_version.clone(),
-                    runtime_release_channel: resolved.release_channel.clone(),
+                    runtime_release_version: target_release_version.clone(),
+                    runtime_release_channel: target_channel,
                     service_action: service_action_for_dry_run(service.as_ref(), false, true),
                     snapshot_id: None,
                     rollback: None,
@@ -2787,8 +2895,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         error,
                     );
                 }
@@ -2800,6 +2908,17 @@ impl Cli {
                 preparation_started,
                 "completed",
             );
+            if let Some(mut summary) = self.current_runtime_job_result(
+                env_name,
+                &current,
+                &prepared,
+                service.as_ref(),
+                operation_lock,
+            ) {
+                summary.runtime_release_version = target_release_version;
+                summary.runtime_release_channel = target_channel;
+                return Ok(summary);
+            }
             let changed = matches!(
                 prepared.action,
                 OfficialRuntimePrepareAction::Installed | OfficialRuntimePrepareAction::Updated
@@ -2831,8 +2950,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     target_runtime_name,
-                    target_version,
-                    target.release_channel_hint(),
+                    target_release_version,
+                    target_channel,
                     transaction,
                     UPGRADE_INTERRUPTED_ERROR.to_string(),
                 );
@@ -2849,16 +2968,20 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         target_runtime_name,
-                        target_version.clone(),
-                        target.release_channel_hint(),
+                        target_release_version.clone(),
+                        target_channel,
                         transaction,
                         error,
                     );
                 }
             };
             let (post_update_note, completion_deferred) = if changed {
-                match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings)
-                {
+                match self.run_post_core_update(
+                    env_name,
+                    &prepared.meta,
+                    &mut transaction.timings,
+                    operation_lock,
+                ) {
                     Ok(result) => {
                         transaction.mark_post_update_completed(result.note.as_deref());
                         (result.note, result.completion_deferred)
@@ -2871,10 +2994,10 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
+                            target_release_version,
+                            target_channel,
                             transaction,
-                            error,
+                            error.to_string(),
                         );
                     }
                 }
@@ -2883,6 +3006,7 @@ impl Cli {
                     env_name,
                     &prepared.meta,
                     &mut transaction.timings,
+                    operation_lock,
                 ) {
                     Ok(config_repaired) => config_repaired,
                     Err(error) => {
@@ -2893,10 +3017,10 @@ impl Cli {
                             previous_binding_name,
                             "runtime",
                             prepared.name,
-                            prepared.meta.release_version,
-                            prepared.meta.release_channel,
+                            target_release_version,
+                            target_channel,
                             transaction,
-                            error,
+                            error.to_string(),
                         );
                     }
                 };
@@ -2931,8 +3055,8 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     format!("failed to publish upgraded runtime: {error}"),
                 );
@@ -2953,8 +3077,8 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
@@ -2965,12 +3089,14 @@ impl Cli {
                 &prepared.name,
                 completion_deferred,
                 &mut transaction.timings,
+                operation_lock,
             );
             let verification_started = transaction.timings.start();
             let verification_note = match self.verify_upgraded_openclaw(
                 env_name,
                 prepared.meta.release_version.as_deref(),
                 service_action.is_some(),
+                operation_lock,
             ) {
                 Ok(note) => {
                     transaction.timings.finish(
@@ -2996,22 +3122,23 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
+                        target_release_version,
+                        target_channel,
                         transaction,
                         error,
                     );
                 }
             };
             let summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
                 binding_kind: "runtime".to_string(),
                 binding_name: prepared.name.clone(),
                 outcome: outcome_for_official_prepare_action(&prepared.action),
-                runtime_release_version: prepared.meta.release_version.clone(),
-                runtime_release_channel: prepared.meta.release_channel.clone(),
+                runtime_release_version: target_release_version,
+                runtime_release_channel: target_channel,
                 service_action,
                 snapshot_id: Some(transaction.snapshot_id.clone()),
                 rollback: None,
@@ -3038,10 +3165,12 @@ impl Cli {
             env_name,
             current.release_version.as_deref(),
             Some(&target_version),
+            operation_lock,
         )?;
         let service = self.upgrade_service_status(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "runtime".to_string(),
                 previous_binding_name: previous_binding_name.clone(),
@@ -3073,7 +3202,7 @@ impl Cli {
                         previous_binding_name,
                         "runtime",
                         current.name,
-                        current.release_version,
+                        Some(target_version.clone()),
                         current.release_channel,
                         error,
                     );
@@ -3113,7 +3242,7 @@ impl Cli {
                 previous_binding_name,
                 "runtime",
                 current.name,
-                current.release_version,
+                Some(target_version.clone()),
                 current.release_channel,
                 transaction,
                 UPGRADE_INTERRUPTED_ERROR.to_string(),
@@ -3129,34 +3258,38 @@ impl Cli {
                     previous_binding_name,
                     "runtime",
                     current.name,
-                    current.release_version,
+                    Some(target_version.clone()),
                     current.release_channel,
                     transaction,
                     error,
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &updated, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "runtime",
-                        previous_binding_name,
-                        "runtime",
-                        updated.name,
-                        updated.release_version,
-                        updated.release_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &updated,
+            &mut transaction.timings,
+            operation_lock,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "runtime",
+                    previous_binding_name,
+                    "runtime",
+                    updated.name,
+                    updated.release_version,
+                    updated.release_channel,
+                    transaction,
+                    error.to_string(),
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -3215,12 +3348,14 @@ impl Cli {
             &updated.name,
             completion_deferred,
             &mut transaction.timings,
+            operation_lock,
         );
         let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
             env_name,
             updated.release_version.as_deref(),
             service_action.is_some(),
+            operation_lock,
         ) {
             Ok(note) => {
                 transaction.timings.finish(
@@ -3254,6 +3389,7 @@ impl Cli {
             }
         };
         let summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: "runtime".to_string(),
             previous_binding_name: previous_binding_name.clone(),
@@ -3311,9 +3447,23 @@ impl Cli {
         launcher_name: &str,
         target: &UpgradeTarget,
         options: UpgradeOptions,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<UpgradeEnvSummary, String> {
         if !target.is_explicit() {
+            let source = self.inspect_launcher_source(env_name, launcher_name)?;
+            if let Some(source) = source.as_ref()
+                && source.head.is_some()
+            {
+                return self.upgrade_source_checkout(
+                    env_name,
+                    launcher_name,
+                    source.clone(),
+                    options,
+                    operation_lock,
+                );
+            }
             return Ok(UpgradeEnvSummary {
+                source,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "launcher".to_string(),
                 previous_binding_name: launcher_name.to_string(),
@@ -3334,23 +3484,32 @@ impl Cli {
 
         let resolved = self.resolve_upgrade_target(target)?;
         let target_runtime_name = resolved.name.clone();
-        let target_version = self.resolved_target_version(env_name, &resolved)?;
-        let source_version =
-            self.ensure_upgrade_is_not_downgrade(env_name, None, target_version.as_deref())?;
+        let target_version = self.resolved_target_version(env_name, &resolved, operation_lock)?;
+        let target_release_version = target_version
+            .clone()
+            .or_else(|| resolved.release_version.clone());
+        let target_channel = resolved.release_channel.clone();
+        let source_version = self.ensure_upgrade_is_not_downgrade(
+            env_name,
+            None,
+            target_version.as_deref(),
+            operation_lock,
+        )?;
         if !target.is_named_runtime() {
             self.ensure_runtime_upgrade_isolated(env_name, &target_runtime_name)?;
         }
         let service = self.upgrade_service_status(env_name)?;
         if options.dry_run {
             return Ok(UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: "launcher".to_string(),
                 previous_binding_name: launcher_name.to_string(),
                 binding_kind: "runtime".to_string(),
                 binding_name: target_runtime_name,
                 outcome: "would-switch".to_string(),
-                runtime_release_version: target_version.clone(),
-                runtime_release_channel: resolved.release_channel.clone(),
+                runtime_release_version: target_release_version.clone(),
+                runtime_release_channel: target_channel,
                 service_action: service_action_for_dry_run(service.as_ref(), true, true),
                 snapshot_id: None,
                 rollback: None,
@@ -3369,8 +3528,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
-                    target.release_channel_hint(),
+                    target_release_version.clone(),
+                    target_channel,
                     error,
                 );
             }
@@ -3410,8 +3569,8 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 target_runtime_name,
-                target_version,
-                target.release_channel_hint(),
+                target_release_version,
+                target_channel,
                 transaction,
                 UPGRADE_INTERRUPTED_ERROR.to_string(),
             );
@@ -3428,34 +3587,38 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     target_runtime_name,
-                    target_version.clone(),
-                    target.release_channel_hint(),
+                    target_release_version.clone(),
+                    target_channel,
                     transaction,
                     error,
                 );
             }
         };
-        let post_update =
-            match self.run_post_core_update(env_name, &prepared.meta, &mut transaction.timings) {
-                Ok(result) => {
-                    transaction.mark_post_update_completed(result.note.as_deref());
-                    result
-                }
-                Err(error) => {
-                    transaction.mark_post_update_failed(&error);
-                    return self.rollback_failed_upgrade(
-                        env_name,
-                        "launcher",
-                        launcher_name.to_string(),
-                        "runtime",
-                        prepared.name,
-                        prepared.meta.release_version,
-                        prepared.meta.release_channel,
-                        transaction,
-                        error,
-                    );
-                }
-            };
+        let post_update = match self.run_post_core_update(
+            env_name,
+            &prepared.meta,
+            &mut transaction.timings,
+            operation_lock,
+        ) {
+            Ok(result) => {
+                transaction.mark_post_update_completed(result.note.as_deref());
+                result
+            }
+            Err(error) => {
+                transaction.mark_post_update_failed(&error);
+                return self.rollback_failed_upgrade(
+                    env_name,
+                    "launcher",
+                    launcher_name.to_string(),
+                    "runtime",
+                    prepared.name,
+                    target_release_version,
+                    target_channel,
+                    transaction,
+                    error.to_string(),
+                );
+            }
+        };
         let post_update_note = post_update.note;
         let completion_deferred = post_update.completion_deferred;
         let publish_started = transaction.timings.start();
@@ -3480,8 +3643,8 @@ impl Cli {
                 launcher_name.to_string(),
                 "runtime",
                 prepared.name,
-                prepared.meta.release_version,
-                prepared.meta.release_channel,
+                target_release_version,
+                target_channel,
                 transaction,
                 format!("failed to publish upgraded runtime: {error}"),
             );
@@ -3502,8 +3665,8 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     error,
                 );
@@ -3514,12 +3677,14 @@ impl Cli {
             &prepared.name,
             completion_deferred,
             &mut transaction.timings,
+            operation_lock,
         );
         let verification_started = transaction.timings.start();
         let verification_note = match self.verify_upgraded_openclaw(
             env_name,
             prepared.meta.release_version.as_deref(),
             service_action.is_some(),
+            operation_lock,
         ) {
             Ok(note) => {
                 transaction.timings.finish(
@@ -3545,22 +3710,23 @@ impl Cli {
                     launcher_name.to_string(),
                     "runtime",
                     prepared.name,
-                    prepared.meta.release_version,
-                    prepared.meta.release_channel,
+                    target_release_version,
+                    target_channel,
                     transaction,
                     error,
                 );
             }
         };
         let summary = UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: "launcher".to_string(),
             previous_binding_name: launcher_name.to_string(),
             binding_kind: "runtime".to_string(),
             binding_name: prepared.name.clone(),
             outcome: "switched".to_string(),
-            runtime_release_version: prepared.meta.release_version.clone(),
-            runtime_release_channel: prepared.meta.release_channel.clone(),
+            runtime_release_version: target_release_version,
+            runtime_release_channel: target_channel,
             service_action,
             snapshot_id: Some(transaction.snapshot_id.clone()),
             rollback: None,
@@ -3576,6 +3742,111 @@ impl Cli {
         self.finish_successful_upgrade(summary, transaction)
     }
 
+    fn current_runtime_job_result(
+        &self,
+        env_name: &str,
+        current: &RuntimeMeta,
+        prepared: &PreparedUpgradeTarget,
+        service: Option<&ServiceSummary>,
+        operation_lock: &EnvironmentOperationLock,
+    ) -> Option<UpgradeEnvSummary> {
+        // Ordinary operator upgrades retain their repair/finalization behavior.
+        // Reuse already verified the installed tree and requested release/selector.
+        if !self.is_upgrade_job(env_name)
+            || !matches!(prepared.action, OfficialRuntimePrepareAction::Reused)
+            || prepared.name != current.name
+            || prepared.meta.runtime_sha256.is_none()
+        {
+            return None;
+        }
+        let build_id = installed_openclaw_build_id(&prepared.meta)?;
+        let environment = self.environment_service().get(env_name).ok()?;
+        if !derive_env_paths(Path::new(&environment.root))
+            .config_path
+            .is_file()
+        {
+            return None;
+        }
+        let validation = self
+            .run_update_mode_openclaw_command_output_with_env(
+                env_name,
+                &prepared.name,
+                "openclaw config validate",
+                &["config", "validate"],
+                &[],
+                Some(operation_lock),
+            )
+            .ok()?;
+        if !validation.status.success()
+            || self
+                .validate_committed_upgrade_target(env_name, &prepared.meta, operation_lock)
+                .is_err()
+        {
+            // Unknown or repairable state belongs to the checkpointed upgrade path.
+            return None;
+        }
+        if let Some(service) = service {
+            if !service.running
+                || service.child_pid.is_none()
+                || service.binding_kind.as_deref() != Some("runtime")
+                || service.binding_name.as_deref() != Some(prepared.name.as_str())
+                || service.issue.is_some()
+            {
+                return None;
+            }
+            let gateway = self
+                .run_update_mode_openclaw_command_output_with_env(
+                    env_name,
+                    &prepared.name,
+                    "openclaw gateway status",
+                    &["gateway", "status", "--deep", "--json"],
+                    &[],
+                    Some(operation_lock),
+                )
+                .ok()?;
+            let status: Value = serde_json::from_str(gateway.stdout.trim()).ok()?;
+            if !gateway.status.success()
+                || status.pointer("/rpc/ok").and_then(Value::as_bool) != Some(true)
+                || status
+                    .pointer("/rpc/server/buildId")
+                    .and_then(Value::as_str)
+                    != Some(build_id.as_str())
+            {
+                return None;
+            }
+        }
+        if let Some(service) = service {
+            if !self
+                .supervisor_service()
+                .running_launch_matches(env_name, service.child_pid?)
+                .ok()?
+            {
+                return None;
+            }
+        } else if !self
+            .supervisor_service()
+            .stopped_launch_observed(env_name)
+            .ok()?
+        {
+            return None;
+        }
+        Some(UpgradeEnvSummary {
+            source: None,
+            env_name: env_name.to_string(),
+            previous_binding_kind: "runtime".to_string(),
+            previous_binding_name: current.name.clone(),
+            binding_kind: "runtime".to_string(),
+            binding_name: prepared.name.clone(),
+            outcome: "up-to-date".to_string(),
+            runtime_release_version: prepared.meta.release_version.clone(),
+            runtime_release_channel: prepared.meta.release_channel.clone(),
+            service_action: None,
+            snapshot_id: None,
+            rollback: None,
+            note: Some("requested runtime is current; config and service unchanged".to_string()),
+        })
+    }
+
     fn upgrade_service_status(&self, env_name: &str) -> Result<Option<ServiceSummary>, String> {
         let meta = self.environment_service().get(env_name)?;
         if !meta.service_enabled || !meta.service_running {
@@ -3588,6 +3859,7 @@ impl Cli {
         &self,
         env_name: &str,
         target: &ResolvedUpgradeTarget,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
         let version_hint = target
             .release_version
@@ -3602,6 +3874,7 @@ impl Cli {
             &target.name,
             "target openclaw --version",
             &["--version"],
+            Some(operation_lock),
         ) else {
             return Ok(version_hint.map(str::to_string));
         };
@@ -3619,18 +3892,20 @@ impl Cli {
         env_name: &str,
         current_version_hint: Option<&str>,
         target_version: Option<&str>,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
         let current_version_hint = current_version_hint
             .filter(|version| compare_runtime_release_versions(version, version).is_some());
-        let current_version =
-            match self.run_openclaw_command(env_name, "current openclaw --version", &["--version"])
-            {
-                Ok(current) => {
-                    release_version_from_output(&current.first_line(), current_version_hint)
-                        .or_else(|| current_version_hint.map(str::to_string))
-                }
-                Err(_) => current_version_hint.map(str::to_string),
-            };
+        let current_version = match self.run_openclaw_command(
+            env_name,
+            "current openclaw --version",
+            &["--version"],
+            Some(operation_lock),
+        ) {
+            Ok(current) => release_version_from_output(&current.first_line(), current_version_hint)
+                .or_else(|| current_version_hint.map(str::to_string)),
+            Err(_) => current_version_hint.map(str::to_string),
+        };
         let Some(target_version) = target_version else {
             return Ok(current_version);
         };
@@ -3763,37 +4038,44 @@ impl Cli {
         &self,
         env_name: &str,
         runtime: &RuntimeMeta,
-    ) -> Result<(), String> {
+        operation_lock: &EnvironmentOperationLock,
+    ) -> Result<(), CandidateFailure> {
         let args = managed_codex_candidate_args();
-        let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true)
-            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
-        let env_meta = self
-            .environment_service()
-            .get(env_name)
-            .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        let launch = resolve_runtime_launch(runtime, &args, &self.env, &self.cwd, true).map_err(
+            |error| {
+                CandidateFailure::launch(format!(
+                    "candidate managed Codex preflight failed: {error}"
+                ))
+            },
+        )?;
+        let env_meta = self.environment_service().get(env_name).map_err(|error| {
+            CandidateFailure::launch(format!("candidate managed Codex preflight failed: {error}"))
+        })?;
         let mut process_env = build_openclaw_env(&env_meta, &self.env);
         crate::managed_node::apply_path_prepend_to_environment(
             &mut process_env,
             launch.path_prepend.as_deref(),
         )
-        .map_err(|error| format!("candidate managed Codex preflight failed: {error}"))?;
+        .map_err(|error| {
+            CandidateFailure::launch(format!("candidate managed Codex preflight failed: {error}"))
+        })?;
         process_env.insert("OPENCLAW_UPDATE_IN_PROGRESS".to_string(), "1".to_string());
 
-        let output = Command::new(&launch.program)
+        let mut command = Command::new(&launch.program);
+        command
             .args(&launch.args)
             .current_dir(resolve_runtime_run_dir(&self.cwd))
             .env_clear()
             .envs(process_env)
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .map_err(|error| {
-                format!(
-                    "candidate managed Codex preflight failed to start {}: {error}",
-                    display_path(Path::new(&launch.program))
-                )
-            })?;
+            .stderr(Stdio::piped());
+        let output = operation_lock.output(command).map_err(|error| {
+            CandidateFailure::launch(format!(
+                "candidate managed Codex preflight failed to start {}: {error}",
+                display_path(Path::new(&launch.program))
+            ))
+        })?;
         let output = SimulationCommandOutput::from_output(output);
         if output.status.success() {
             return Ok(());
@@ -3801,9 +4083,10 @@ impl Cli {
         if candidate_codex_preflight_is_unsupported(&output.stdout, &output.stderr) {
             return Ok(());
         }
-        Err(format!(
-            "candidate managed Codex preflight failed: {}. Repair or reinstall the staged OpenClaw runtime, then rerun the upgrade; the source environment was not changed",
-            output.failure_summary()
+        Err(CandidateFailure::from_output(
+            output.status.code(),
+            &output.stdout,
+            &output.stderr,
         ))
     }
 
@@ -3984,8 +4267,15 @@ impl Cli {
         env_name: &str,
         expected_version: Option<&str>,
         verify_gateway: bool,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<Option<String>, String> {
-        let version = self.run_openclaw_command(env_name, "openclaw --version", &["--version"])?;
+        // Node preloads and launcher arguments can write state before --version exits.
+        let version = self.run_openclaw_command(
+            env_name,
+            "openclaw --version",
+            &["--version"],
+            Some(operation_lock),
+        )?;
         let actual_version = version.first_line();
         if let Some(expected_version) = expected_version
             && !version_output_matches_expected(actual_version.trim(), expected_version)
@@ -3996,24 +4286,51 @@ impl Cli {
             ));
         }
 
+        let mut build_note = None;
         if verify_gateway {
+            // Native CLI startup and exit can write diagnostic state even for
+            // status queries, so retain custody through the child's exit.
             let gateway_status = self.capture_openclaw_command(
                 env_name,
                 "openclaw gateway status",
                 &["gateway", "status", "--deep", "--json"],
+                Some(operation_lock),
             )?;
-            if let Err(error) = verify_gateway_status_readiness(&gateway_status.stdout) {
-                return if gateway_status.status.success() {
-                    Err(error)
-                } else {
-                    Err(format!("{error}; {}", gateway_status.failure_summary()))
-                };
+            let status =
+                verify_gateway_status_readiness(&gateway_status.stdout).map_err(|error| {
+                    if gateway_status.status.success() {
+                        error
+                    } else {
+                        format!("{error}; {}", gateway_status.failure_summary())
+                    }
+                })?;
+            let env = self.environment_service().get(env_name)?;
+            let expected_build_id = if let Some(runtime_name) = env.default_runtime.as_deref() {
+                let runtime = get_runtime(runtime_name, &self.env, &self.cwd)?;
+                installed_openclaw_build_id(&runtime)
+            } else if let Some(launcher_name) = env.default_launcher.as_deref() {
+                let launcher = self.launcher_service().show(launcher_name)?;
+                // Read the current artifact only; identity verification must not inspect Git
+                // or rebuild source, and does not establish historical source recovery.
+                crate::launcher::launcher_source_root(&launcher)
+                    .and_then(|root| {
+                        crate::launcher::read_source_json(&root, "dist/build-info.json", 65536).ok()
+                    })
+                    .and_then(|info| openclaw_build_id(&info))
+            } else {
+                None
+            };
+            if let Some(expected_build_id) = expected_build_id {
+                build_note = Some(verify_gateway_build_id(&status, &expected_build_id)?);
             }
         }
 
         Ok(Some(format!(
-            "post-upgrade verification completed for OpenClaw {}",
-            actual_version.trim()
+            "post-upgrade verification completed for OpenClaw {}{}",
+            actual_version.trim(),
+            build_note
+                .map(|note| format!("; {note}"))
+                .unwrap_or_default()
         )))
     }
 
@@ -4022,8 +4339,9 @@ impl Cli {
         env_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
-        let output = self.capture_openclaw_command(env_name, name, args)?;
+        let output = self.capture_openclaw_command(env_name, name, args, operation_lock)?;
         if output.status.success() {
             Ok(output)
         } else {
@@ -4036,13 +4354,14 @@ impl Cli {
         env_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
             .environment_service()
             .resolve(env_name, None, None, &args)
             .map_err(|error| format!("{name} failed: {error}"))?;
-        self.run_resolved_for_simulation(resolved, &[])
+        self.run_resolved_with_operation_lock(resolved, &[], operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 
@@ -4051,10 +4370,12 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
-    ) -> Result<PostCoreUpdateResult, String> {
+        operation_lock: &EnvironmentOperationLock,
+    ) -> Result<PostCoreUpdateResult, PostCoreUpdateFailure> {
         // Resolve the replacement explicitly while the previous binding remains published.
         // A failed finalizer can then roll back without ever activating the replacement.
-        let config_repaired = self.prepare_target_openclaw_update(env_name, runtime, timings)?;
+        let config_repaired =
+            self.prepare_target_openclaw_update(env_name, runtime, timings, operation_lock)?;
         let finalize_started = timings.start();
         let output = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
@@ -4062,6 +4383,7 @@ impl Cli {
             "openclaw update finalize",
             &["update", "finalize", "--json", "--yes", "--no-restart"],
             &[("OPENCLAW_UPDATE_POST_CORE", "1")],
+            Some(operation_lock),
         ) {
             Ok(output) => output,
             Err(error) => {
@@ -4072,7 +4394,7 @@ impl Cli {
                     finalize_started,
                     "failed",
                 );
-                return Err(error);
+                return Err(PostCoreUpdateFailure::Finalization(error));
             }
         };
         let child_phases = parse_openclaw_finalize_phases(&output.stdout);
@@ -4088,10 +4410,10 @@ impl Cli {
             } else {
                 timings.append_openclaw_phases(finalize_started, &child_phases);
             }
-            return Err(format!(
+            return Err(PostCoreUpdateFailure::Finalization(format!(
                 "openclaw update finalize failed: {}",
                 output.failure_summary()
-            ));
+            )));
         }
         let completion_deferred = child_phases
             .iter()
@@ -4122,11 +4444,14 @@ impl Cli {
         env_name: &str,
         runtime: &RuntimeMeta,
         timings: &mut UpgradeTimingRecorder,
-    ) -> Result<bool, String> {
-        let config_repaired =
-            self.repair_target_openclaw_config(env_name, &runtime.name, timings)?;
+        operation_lock: &EnvironmentOperationLock,
+    ) -> Result<bool, PostCoreUpdateFailure> {
+        let config_repaired = self
+            .repair_target_openclaw_config(env_name, &runtime.name, timings, operation_lock)
+            .map_err(PostCoreUpdateFailure::Configuration)?;
         let candidate_started = timings.start();
-        let candidate_result = self.validate_committed_upgrade_target(env_name, runtime);
+        let candidate_result =
+            self.validate_committed_upgrade_target(env_name, runtime, operation_lock);
         timings.finish(
             "ocm",
             "managedCodexCandidate",
@@ -4138,12 +4463,9 @@ impl Cli {
                 "failed"
             },
         );
-        candidate_result.map_err(|error| {
-            if config_repaired {
-                format!("candidate validation failed after target config repair: {error}")
-            } else {
-                error
-            }
+        candidate_result.map_err(|failure| PostCoreUpdateFailure::Candidate {
+            failure,
+            config_repaired,
         })?;
         Ok(config_repaired)
     }
@@ -4154,6 +4476,7 @@ impl Cli {
         runtime_name: &str,
         deferred: bool,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Option<String> {
         if !deferred {
             return None;
@@ -4164,6 +4487,7 @@ impl Cli {
             runtime_name,
             "openclaw completion cache refresh",
             &["completion", "--write-state"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4188,6 +4512,7 @@ impl Cli {
         env_name: &str,
         runtime_name: &str,
         timings: &mut UpgradeTimingRecorder,
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<bool, String> {
         let validation_started = timings.start();
         let env = self
@@ -4206,11 +4531,13 @@ impl Cli {
             return Ok(false);
         }
 
-        let validation = match self.run_update_mode_openclaw_command_output(
+        let validation = match self.run_update_mode_openclaw_command_output_with_env(
             env_name,
             runtime_name,
             "openclaw config validate",
             &["config", "validate"],
+            &[],
+            Some(operation_lock),
         ) {
             Ok(validation) => validation,
             Err(error) => {
@@ -4252,6 +4579,7 @@ impl Cli {
             runtime_name,
             "openclaw doctor",
             &["doctor", "--non-interactive", "--fix"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4271,6 +4599,7 @@ impl Cli {
             runtime_name,
             "openclaw config validate after doctor",
             &["config", "validate"],
+            operation_lock,
         );
         timings.finish(
             "ocm",
@@ -4293,9 +4622,16 @@ impl Cli {
         runtime_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: &EnvironmentOperationLock,
     ) -> Result<(), String> {
-        let output =
-            self.run_update_mode_openclaw_command_output(env_name, runtime_name, name, args)?;
+        let output = self.run_update_mode_openclaw_command_output_with_env(
+            env_name,
+            runtime_name,
+            name,
+            args,
+            &[],
+            Some(operation_lock),
+        )?;
         if output.status.success() {
             Ok(())
         } else {
@@ -4309,6 +4645,7 @@ impl Cli {
         runtime_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         self.run_update_mode_openclaw_command_output_with_env(
             env_name,
@@ -4316,6 +4653,7 @@ impl Cli {
             name,
             args,
             &[],
+            operation_lock,
         )
     }
 
@@ -4326,6 +4664,7 @@ impl Cli {
         name: &str,
         args: &[&str],
         extra_env: &[(&str, &str)],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
@@ -4340,7 +4679,7 @@ impl Cli {
             ("OPENCLAW_UPDATE_PARENT_ALLOWS_GATEWAY_ACTIVATION", "0"),
         ];
         command_env.extend_from_slice(extra_env);
-        self.run_resolved_for_simulation(resolved, &command_env)
+        self.run_resolved_with_operation_lock(resolved, &command_env, operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 
@@ -4350,13 +4689,14 @@ impl Cli {
         launcher_name: &str,
         name: &str,
         args: &[&str],
+        operation_lock: Option<&EnvironmentOperationLock>,
     ) -> Result<SimulationCommandOutput, String> {
         let args = args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>();
         let resolved = self
             .environment_service()
             .resolve(env_name, None, Some(launcher_name.to_string()), &args)
             .map_err(|error| format!("{name} failed: {error}"))?;
-        self.run_resolved_for_simulation(resolved, &[])
+        self.run_resolved_with_operation_lock(resolved, &[], operation_lock)
             .map_err(|error| format!("{name} failed: {error}"))
     }
 
@@ -4516,6 +4856,8 @@ impl Cli {
                 status: "not-run".to_string(),
                 note: None,
             },
+            candidate_failure: None,
+            candidate_runtime_recovery: CandidateRuntimeRecovery::Retained,
             service_quiesced,
             mutated_runtime_names: BTreeSet::new(),
             rollback_of,
@@ -4609,53 +4951,113 @@ impl Cli {
                 "runtime backup for in-place upgrade of \"{runtime_name}\" was not created"
             ));
         };
-        let Some(source_root) = backup.backup_root.take() else {
+        self.retain_runtime_backup(env_name, &transaction.id, &transaction.snapshot_id, backup)
+    }
+
+    fn retain_runtime_backup(
+        &self,
+        env_name: &str,
+        transaction_id: &str,
+        snapshot_id: &str,
+        backup: &mut RuntimeRollbackBackup,
+    ) -> Result<(), String> {
+        let runtime_name = backup.meta.name.clone();
+        let Some(source_root) = backup.backup_root.as_ref() else {
             return Err(format!(
                 "runtime \"{runtime_name}\" does not have installer-managed bytes to retain"
             ));
         };
         let transaction_recovery_root =
-            upgrade_history_recovery_dir(env_name, &transaction.id, &self.env, &self.cwd)?;
+            upgrade_history_recovery_dir(env_name, transaction_id, &self.env, &self.cwd)?;
         let recovery_root = upgrade_history_runtime_recovery_dir(
             env_name,
-            &transaction.id,
+            transaction_id,
             &runtime_name,
             &self.env,
             &self.cwd,
         )?;
-        if transaction_recovery_root.exists() {
-            backup.backup_root = Some(source_root);
+        if backup.retained_root.as_ref() == Some(&transaction_recovery_root) {
+            write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
+            backup.backup_id = Some(runtime_name);
+            return Ok(());
+        }
+        if recovery_root.exists() {
             return Err(format!(
                 "runtime recovery path already exists: {}",
-                display_path(&transaction_recovery_root)
+                display_path(&recovery_root)
             ));
         }
-        fs::create_dir_all(&recovery_root).map_err(|error| error.to_string())?;
-        if let Err(error) = fs::write(
-            transaction_recovery_root.join("snapshot-id"),
-            &transaction.snapshot_id,
-        ) {
-            let _ = fs::remove_dir_all(&transaction_recovery_root);
-            backup.backup_root = Some(source_root);
-            return Err(format!(
-                "failed to record the recovery snapshot at {}: {error}",
-                display_path(&transaction_recovery_root)
-            ));
-        }
+        let created_transaction_root = !transaction_recovery_root.exists();
         let recovery_install_root = recovery_root.join("install-root");
-        if let Err(error) = fs::rename(&source_root, &recovery_install_root) {
-            let _ = fs::remove_dir_all(&transaction_recovery_root);
-            backup.backup_root = Some(source_root);
-            return Err(format!(
-                "failed to retain runtime recovery bytes at {}: {error}",
-                display_path(&recovery_install_root)
-            ));
+        let retention = (|| {
+            fs::create_dir_all(&recovery_root).map_err(|error| error.to_string())?;
+            let marker = transaction_recovery_root.join("snapshot-id");
+            if marker.exists() {
+                let recorded = fs::read_to_string(&marker).map_err(|error| error.to_string())?;
+                if recorded != snapshot_id {
+                    return Err("runtime recovery snapshot marker does not match".to_string());
+                }
+            } else {
+                fs::write(&marker, snapshot_id).map_err(|error| error.to_string())?;
+            }
+            // Persist metadata before moving bytes, and keep custody on every error.
+            write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
+            fs::rename(source_root, &recovery_install_root).map_err(|error| {
+                format!(
+                    "failed to retain runtime recovery bytes at {}: {error}",
+                    display_path(&recovery_install_root)
+                )
+            })
+        })();
+        if let Err(error) = retention {
+            // The move did not complete. Remove only this attempt's metadata;
+            // never discard an existing transaction's other recovery material.
+            let _ = fs::remove_dir_all(&recovery_root);
+            if created_transaction_root {
+                let _ = fs::remove_dir_all(&transaction_recovery_root);
+            }
+            return Err(error);
         }
         backup.backup_root = Some(recovery_install_root);
         backup.retained_root = Some(transaction_recovery_root);
-        write_json(&recovery_root.join("runtime.json"), &backup.meta)?;
         backup.backup_id = Some(runtime_name);
         Ok(())
+    }
+
+    fn retain_unresolved_runtime_recovery(
+        &self,
+        env_name: &str,
+        transaction: &mut UpgradeTransaction,
+    ) -> Option<String> {
+        let mut notes = Vec::new();
+        for backup in &mut transaction.runtime_backups {
+            if !transaction
+                .mutated_runtime_names
+                .contains(&backup.meta.name)
+                || backup.backup_root.is_none()
+            {
+                continue;
+            }
+            if let Err(error) = self.retain_runtime_backup(
+                env_name,
+                &transaction.id,
+                &transaction.snapshot_id,
+                backup,
+            ) {
+                notes.push(format!(
+                    "Runtime recovery metadata requires attention: {error}."
+                ));
+            }
+            if let Some(path) = backup.backup_root.as_ref() {
+                notes.push(format!(
+                    "Previous runtime \"{}\" files retained at {}. Recovery remains unresolved; preserve these files and snapshot \"{}\" for operator recovery.",
+                    backup.meta.name,
+                    display_path(path),
+                    transaction.snapshot_id,
+                ));
+            }
+        }
+        (!notes.is_empty()).then(|| notes.join(" "))
     }
 
     fn record_upgrade_history(
@@ -4755,6 +5157,7 @@ impl Cli {
         error: String,
     ) -> Result<UpgradeEnvSummary, String> {
         Ok(UpgradeEnvSummary {
+            source: None,
             env_name: env_name.to_string(),
             previous_binding_kind: previous_binding_kind.to_string(),
             previous_binding_name,
@@ -4785,6 +5188,17 @@ impl Cli {
         mut transaction: UpgradeTransaction,
         error: String,
     ) -> Result<UpgradeEnvSummary, String> {
+        // Candidate diagnostics are redacted again below. Keep independent OCM
+        // details off Authorization lines without changing ordinary warning output.
+        let separator = if transaction.candidate_failure.is_some() {
+            "\n"
+        } else {
+            " "
+        };
+        let join_notes = |left: Option<String>, right: Option<String>| match (left, right) {
+            (Some(left), Some(right)) => Some(format!("{left}{separator}{right}")),
+            (left, right) => left.or(right),
+        };
         if !transaction.rollback_enabled {
             let snapshot_id = transaction.snapshot_id.clone();
             let service_restore_warning = if transaction.service_before.enabled
@@ -4800,6 +5214,7 @@ impl Cli {
                 None
             };
             let mut summary = UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -4811,28 +5226,31 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("disabled".to_string()),
-                note: join_optional_warnings(
+                note: join_notes(
                     Some(format!("upgrade failed and rollback was disabled: {error}")),
                     service_restore_warning,
                 ),
             };
             if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
-                summary.note = join_optional_warnings(
+                summary.note = join_notes(
                     summary.note,
                     Some(format!("upgrade history was not recorded: {history_error}")),
                 );
             }
+            self.append_candidate_recovery_note(&mut summary, &transaction, false);
             transaction.cleanup();
             return Ok(summary);
         }
 
-        let rollback_result = self.rollback_upgrade_locked(env_name, &transaction);
+        let rollback_result = self.rollback_upgrade_locked(env_name, &mut transaction);
+        let rollback_restored = rollback_result.is_ok();
         if let Ok(cleanup_note) = &rollback_result {
             transaction.cleanup_note = cleanup_note.clone();
         }
         let snapshot_id = transaction.snapshot_id.clone();
         let mut summary = match rollback_result {
             Ok(cleanup_warning) => UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -4844,7 +5262,7 @@ impl Cli {
                 service_action: None,
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("restored".to_string()),
-                note: join_optional_warnings(
+                note: join_notes(
                     Some(format!(
                         "upgrade failed, so ocm restored the pre-upgrade snapshot: {error}"
                     )),
@@ -4852,6 +5270,7 @@ impl Cli {
                 ),
             },
             Err(rollback_error) => UpgradeEnvSummary {
+                source: None,
                 env_name: env_name.to_string(),
                 previous_binding_kind: previous_binding_kind.to_string(),
                 previous_binding_name,
@@ -4864,24 +5283,115 @@ impl Cli {
                 snapshot_id: Some(snapshot_id),
                 rollback: Some("failed".to_string()),
                 note: Some(format!(
-                    "upgrade failed ({error}); rollback also failed: {rollback_error}"
+                    "upgrade failed ({error});{separator}rollback also failed: {rollback_error}"
                 )),
             },
         };
+        if !rollback_restored {
+            let recovery_note = self.retain_unresolved_runtime_recovery(env_name, &mut transaction);
+            transaction.cleanup_note =
+                join_optional_warnings(transaction.cleanup_note, recovery_note.clone());
+            summary.note = join_notes(summary.note, recovery_note);
+        }
         if let Err(history_error) = self.record_upgrade_history(&transaction, &summary) {
-            summary.note = join_optional_warnings(
+            summary.note = join_notes(
                 summary.note,
                 Some(format!("upgrade history was not recorded: {history_error}")),
             );
         }
-        transaction.cleanup();
+        self.append_candidate_recovery_note(&mut summary, &transaction, rollback_restored);
+        transaction.finish_failed(rollback_restored);
         Ok(summary)
+    }
+
+    fn append_candidate_recovery_note(
+        &self,
+        summary: &mut UpgradeEnvSummary,
+        transaction: &UpgradeTransaction,
+        rollback_restored: bool,
+    ) {
+        let Some(kind) = transaction.candidate_failure else {
+            return;
+        };
+        let runtime_name = &transaction.target.name;
+        let binding = self.environment_service().get(&summary.env_name).ok();
+        let binding_note = match binding.as_ref() {
+            Some(env) => match (&env.default_runtime, &env.default_launcher) {
+                (Some(runtime), _) => format!("Current environment binding: runtime {runtime:?}."),
+                (_, Some(launcher)) => {
+                    format!("Current environment binding: launcher {launcher:?}.")
+                }
+                _ => "The environment has no runtime or launcher binding.".to_string(),
+            },
+            None => "The current environment binding could not be confirmed.".to_string(),
+        };
+        let mut state = transaction.candidate_runtime_recovery;
+        if matches!(state, CandidateRuntimeRecovery::Retained)
+            && !self
+                .runtime_service()
+                .show(runtime_name)
+                .ok()
+                .is_some_and(|runtime| {
+                    Path::new(&runtime.binary_path)
+                        .try_exists()
+                        .unwrap_or(false)
+                })
+        {
+            state = CandidateRuntimeRecovery::Incomplete;
+        }
+        let runtime_note = match state {
+            CandidateRuntimeRecovery::Retained => {
+                format!("Candidate runtime {runtime_name:?} was retained.")
+            }
+            CandidateRuntimeRecovery::RestoredPrevious => {
+                format!("The previous runtime was restored at {runtime_name:?}.")
+            }
+            CandidateRuntimeRecovery::Removed => {
+                format!("Candidate runtime {runtime_name:?} was removed during rollback.")
+            }
+            CandidateRuntimeRecovery::Incomplete => format!(
+                "Candidate runtime {runtime_name:?} restoration or cleanup could not be confirmed."
+            ),
+        };
+        let mut note = format!("OCM recovery result: {binding_note} {runtime_note}");
+        if !transaction.rollback_enabled && transaction.migration.status == "repaired" {
+            note.push_str(" Target configuration repair completed; its changes were retained because rollback was disabled.");
+        }
+        if (transaction.rollback_enabled && !rollback_restored)
+            || matches!(state, CandidateRuntimeRecovery::Incomplete)
+            || binding.is_none()
+        {
+            note.push_str(&format!(
+                " Inspect the environment and runtime with `ocm env show {:?}` and `ocm runtime show {runtime_name:?}`, and resolve the recovery or cleanup errors before retrying.",
+                summary.env_name,
+            ));
+        } else {
+            match kind {
+                CandidateFailureKind::Configuration => note.push_str(" Correct the reported target-configuration finding before retrying the upgrade."),
+                CandidateFailureKind::ManagedRuntime => match state {
+                    CandidateRuntimeRecovery::Retained => note.push_str(&format!(" Repair or reinstall runtime {runtime_name:?}, then retry the upgrade.")),
+                    CandidateRuntimeRecovery::RestoredPrevious | CandidateRuntimeRecovery::Removed => note.push_str(" Retry the upgrade with a corrected target release to prepare a fresh candidate."),
+                    CandidateRuntimeRecovery::Incomplete => unreachable!("handled above"),
+                },
+                CandidateFailureKind::Launch => note.push_str(" Resolve the reported executable, dependency, or permission error before retrying the upgrade."),
+                CandidateFailureKind::Other => note.push_str(" Resolve the reported candidate findings before retrying the upgrade."),
+            }
+        }
+        // History was recorded above using only transaction cleanup diagnostics.
+        // This operator-facing note can contain private, redacted child output.
+        // Redaction of an Authorization header consumes the rest of its line.
+        // Keep OCM's recovery advice separate from every child diagnostic line.
+        let combined = match summary.note.take() {
+            Some(diagnostic) => format!("{diagnostic}\n{note}"),
+            None => note,
+        };
+        summary.note = crate::infra::command_output::bounded_summary(combined.lines());
     }
 
     fn rollback_upgrade_locked(
         &self,
         env_name: &str,
-        transaction: &UpgradeTransaction,
+        transaction: &mut UpgradeTransaction,
     ) -> Result<Option<String>, String> {
         let changes_runtime_trees = !transaction.mutated_runtime_names.is_empty();
         let changes_binding = transaction.source.kind != transaction.target.kind
@@ -4898,7 +5408,14 @@ impl Cli {
                 .mutated_runtime_names
                 .contains(&backup.meta.name)
         }) {
+            let restores_candidate = runtime_backup.meta.name == transaction.target.name;
+            if restores_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Incomplete;
+            }
             self.restore_runtime_backup(runtime_backup)?;
+            if restores_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::RestoredPrevious;
+            }
         }
         let restore = self
             .environment_service()
@@ -4925,7 +5442,14 @@ impl Cli {
             }
             Ok::<(), String>(())
         })();
-        acceptance.map_err(|error| format!("{error}; {}", restore.retained_operation_note()))?;
+        acceptance.map_err(|error| {
+            let separator = if transaction.candidate_failure.is_some() {
+                "\n"
+            } else {
+                "; "
+            };
+            format!("{error}{separator}{}", restore.retained_operation_note())
+        })?;
         let mut restored = self
             .environment_service()
             .commit_snapshot_restore_locked(restore);
@@ -4934,10 +5458,33 @@ impl Cli {
             .iter()
             .filter(|runtime_name| transaction.mutated_runtime_names.contains(*runtime_name))
         {
-            if let Err(error) = self.remove_runtime_created_during_upgrade(runtime_name) {
-                restored.warnings.push(format!(
+            let removes_candidate = runtime_name == &transaction.target.name;
+            if removes_candidate {
+                transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Incomplete;
+            }
+            match self.remove_runtime_created_during_upgrade(runtime_name) {
+                Ok(()) if removes_candidate => {
+                    let absent = [
+                        runtime_meta_path(runtime_name, &self.env, &self.cwd),
+                        runtime_install_root(runtime_name, &self.env, &self.cwd),
+                    ]
+                    .into_iter()
+                    .all(|path| {
+                        path.is_ok_and(|path| {
+                            matches!(
+                                fs::symlink_metadata(path),
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                            )
+                        })
+                    });
+                    if absent {
+                        transaction.candidate_runtime_recovery = CandidateRuntimeRecovery::Removed;
+                    }
+                }
+                Ok(()) => {}
+                Err(error) => restored.warnings.push(format!(
                     "unused runtime {runtime_name} cleanup requires attention: {error}"
-                ));
+                )),
             }
         }
         Ok((!restored.warnings.is_empty()).then(|| restored.warnings.join("; ")))
@@ -4997,6 +5544,47 @@ struct OpenClawFinalizePhaseTiming {
 struct PostCoreUpdateResult {
     note: Option<String>,
     completion_deferred: bool,
+}
+
+#[derive(Debug)]
+enum PostCoreUpdateFailure {
+    Configuration(String),
+    Candidate {
+        failure: CandidateFailure,
+        config_repaired: bool,
+    },
+    Finalization(String),
+}
+
+impl fmt::Display for PostCoreUpdateFailure {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Configuration(message) | Self::Finalization(message) => {
+                formatter.write_str(message)
+            }
+            Self::Candidate {
+                failure,
+                config_repaired,
+            } => {
+                if *config_repaired {
+                    write!(
+                        formatter,
+                        "candidate validation failed after target config repair: {failure}"
+                    )
+                } else {
+                    write!(formatter, "{failure}")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum CandidateRuntimeRecovery {
+    Retained,
+    RestoredPrevious,
+    Removed,
+    Incomplete,
 }
 
 fn parse_openclaw_finalize_phases(stdout: &str) -> Vec<OpenClawFinalizePhaseTiming> {
@@ -5182,6 +5770,9 @@ struct UpgradeTransaction {
     service_before: UpgradeHistoryServiceState,
     migration: UpgradeHistoryStage,
     finalization: UpgradeHistoryStage,
+    // Transient report context; child diagnostics never belong in history.
+    candidate_failure: Option<CandidateFailureKind>,
+    candidate_runtime_recovery: CandidateRuntimeRecovery,
     service_quiesced: bool,
     mutated_runtime_names: BTreeSet<String>,
     rollback_of: Option<String>,
@@ -5206,21 +5797,29 @@ impl UpgradeTransaction {
         self.finalization.status = "completed".to_string();
     }
 
-    fn mark_post_update_failed(&mut self, error: &str) {
-        if error.contains("openclaw update finalize failed") {
-            self.migration.status = "validated".to_string();
-            self.finalization.status = "failed".to_string();
-        } else if error.contains("candidate managed Codex preflight failed") {
-            self.migration.status =
-                if error.starts_with("candidate validation failed after target config repair") {
-                    "repaired".to_string()
+    fn mark_post_update_failed(&mut self, error: &PostCoreUpdateFailure) {
+        match error {
+            PostCoreUpdateFailure::Finalization(_) => {
+                self.migration.status = "validated".to_string();
+                self.finalization.status = "failed".to_string();
+            }
+            PostCoreUpdateFailure::Candidate {
+                failure,
+                config_repaired,
+            } => {
+                self.migration.status = if *config_repaired {
+                    "repaired"
                 } else {
-                    "validated".to_string()
-                };
-            self.finalization.status = "not-run".to_string();
-        } else {
-            self.migration.status = "failed".to_string();
-            self.finalization.status = "not-run".to_string();
+                    "validated"
+                }
+                .to_string();
+                self.finalization.status = "not-run".to_string();
+                self.candidate_failure = Some(failure.kind);
+            }
+            PostCoreUpdateFailure::Configuration(_) => {
+                self.migration.status = "failed".to_string();
+                self.finalization.status = "not-run".to_string();
+            }
         }
     }
 
@@ -5241,6 +5840,19 @@ impl UpgradeTransaction {
     fn cleanup(self) {
         for runtime_backup in self.runtime_backups {
             runtime_backup.cleanup();
+        }
+    }
+
+    fn finish_failed(self, restored: bool) {
+        for mut backup in self.runtime_backups {
+            if !restored && self.mutated_runtime_names.contains(&backup.meta.name) {
+                // Failed recovery never makes the prior bytes disposable, even
+                // when recording or relocating recovery metadata also failed.
+                backup.backup_root.take();
+                backup.retained_root.take();
+            } else {
+                backup.cleanup();
+            }
         }
     }
 
@@ -5582,42 +6194,90 @@ fn command_output_reports_unsupported_command(stdout: &str, stderr: &str) -> boo
     })
 }
 
-fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool {
+fn candidate_codex_preflight_json_is_unsupported(value: &Value, stderr: &str) -> bool {
     const CHECK_ID: &str = "codex/managed-app-server";
-    if let Ok(value) = serde_json::from_str::<Value>(stdout)
-        && value
-            .get("findings")
-            .and_then(Value::as_array)
-            .is_some_and(|findings| {
-                findings.iter().any(|finding| {
-                    finding.get("checkId").and_then(Value::as_str)
-                        == Some("core/doctor/lint-selection")
-                        && finding.get("path").and_then(Value::as_str) == Some(CHECK_ID)
-                        && finding
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .is_some_and(|message| {
-                                message.contains("Unknown health check id selected by --only")
-                            })
-                })
-            })
+    let Some(object) = value.as_object() else {
+        return false;
+    };
+    if object.get("ok").and_then(Value::as_bool) != Some(false)
+        || object.get("checksRun").and_then(Value::as_u64) != Some(0)
+        || object
+            .get("checksSkipped")
+            .and_then(Value::as_u64)
+            .is_none()
     {
-        return true;
+        return false;
     }
+    let Some([finding]) = object
+        .get("findings")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    finding.get("checkId").and_then(Value::as_str) == Some("core/doctor/lint-selection")
+        && finding.get("path").and_then(Value::as_str) == Some(CHECK_ID)
+        && finding.get("severity").and_then(Value::as_str) == Some("error")
+        && finding
+            .get("message")
+            .and_then(Value::as_str)
+            .is_some_and(|message| {
+                message.trim().trim_end_matches('.')
+                    == "Unknown health check id selected by --only: codex/managed-app-server"
+                    // Native Doctor mirrors findings to stderr during updates.
+                    // Accept only the same sole selection failure, never other diagnostics.
+                    && (stderr.trim().is_empty()
+                        || stderr.trim()
+                            == format!(
+                                "Doctor lint error [core/doctor/lint-selection]: {message}"
+                            ))
+            })
+}
 
-    let normalized = format!("{stdout}\n{stderr}").to_ascii_lowercase();
-    [
-        "unknown command 'doctor'",
-        "unknown command \"doctor\"",
-        "unrecognized command 'doctor'",
-        "unrecognized command \"doctor\"",
-        "unknown option '--lint'",
-        "unknown option \"--lint\"",
-        "unrecognized option '--lint'",
-        "unrecognized option \"--lint\"",
-    ]
-    .iter()
-    .any(|marker| normalized.contains(marker))
+fn candidate_codex_preflight_text_is_unsupported(stdout: &str, stderr: &str) -> bool {
+    let mut unsupported_lines = 0;
+    for line in stdout.lines().chain(stderr.lines()) {
+        let normalized = line.trim().to_ascii_lowercase();
+        if normalized.is_empty() {
+            continue;
+        }
+        let diagnostic = normalized
+            .strip_prefix("error: ")
+            .unwrap_or(&normalized)
+            .trim_end_matches('.');
+        if [
+            "unknown command 'doctor'",
+            "unknown command \"doctor\"",
+            "unrecognized command 'doctor'",
+            "unrecognized command \"doctor\"",
+            "unknown option '--lint'",
+            "unknown option \"--lint\"",
+            "unrecognized option '--lint'",
+            "unrecognized option \"--lint\"",
+        ]
+        .contains(&diagnostic)
+        {
+            unsupported_lines += 1;
+            continue;
+        }
+        if normalized.starts_with("usage:") || normalized.starts_with("for more information") {
+            continue;
+        }
+        return false;
+    }
+    unsupported_lines == 1
+}
+
+fn candidate_codex_preflight_is_unsupported(stdout: &str, stderr: &str) -> bool {
+    let trimmed_stdout = stdout.trim();
+    if !trimmed_stdout.is_empty() {
+        match serde_json::from_str::<Value>(trimmed_stdout) {
+            Ok(value) => return candidate_codex_preflight_json_is_unsupported(&value, stderr),
+            Err(_) if trimmed_stdout.starts_with(['{', '[']) => return false,
+            Err(_) => {}
+        }
+    }
+    candidate_codex_preflight_text_is_unsupported(stdout, stderr)
 }
 
 fn shell_command(command: &str) -> Command {
@@ -5674,7 +6334,7 @@ fn sort_batch_results(results: &mut [UpgradeEnvSummary], env_names: &[String]) {
 fn is_changed_upgrade_outcome(outcome: &str) -> bool {
     matches!(
         outcome,
-        "updated" | "switched" | "would-update" | "would-switch"
+        "updated" | "source-updated" | "switched" | "would-update" | "would-switch"
     )
 }
 
@@ -5718,16 +6378,51 @@ fn join_optional_warnings(left: Option<String>, right: Option<String>) -> Option
     }
 }
 
-fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
+fn installed_openclaw_build_id(runtime: &RuntimeMeta) -> Option<String> {
+    if !is_openclaw_package_runtime(runtime) {
+        return None;
+    }
+    let path = Path::new(&runtime.binary_path)
+        .parent()?
+        .join("dist/build-info.json");
+    let info: Value = serde_json::from_reader(fs::File::open(path).ok()?.take(65536)).ok()?;
+    openclaw_build_id(&info)
+}
+
+fn openclaw_build_id(info: &Value) -> Option<String> {
+    let build_id = info.get("buildId")?.as_str()?.trim();
+    // Match OpenClaw's optional build metadata contract; older packages omit it.
+    (!build_id.is_empty() && build_id.len() <= 96).then(|| build_id.to_string())
+}
+
+fn verify_gateway_build_id(status: &Value, expected: &str) -> Result<&'static str, String> {
+    let Some(actual) = status
+        .pointer("/rpc/server/buildId")
+        .and_then(Value::as_str)
+    else {
+        return Ok("running Gateway build identity unavailable");
+    };
+    if actual != expected {
+        return Err(
+            "post-upgrade gateway build verification failed: running Gateway build does not match the selected OpenClaw artifact"
+                .to_string(),
+        );
+    }
+    Ok("running Gateway build matches the selected OpenClaw artifact")
+}
+
+fn verify_gateway_status_readiness(stdout: &str) -> Result<Value, String> {
     let status: Value = serde_json::from_str(stdout.trim()).map_err(|error| {
         format!("post-upgrade gateway readiness failed: invalid status JSON ({error})")
     })?;
 
     if let Some(ready) = status.pointer("/rpc/ok").and_then(Value::as_bool) {
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
     if let Some(ready) = status.get("ok").and_then(Value::as_bool) {
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
     if let Some(targets) = status.get("targets").and_then(Value::as_array) {
         let ready = targets.iter().any(|target| {
@@ -5736,7 +6431,8 @@ fn verify_gateway_status_readiness(stdout: &str) -> Result<(), String> {
                 .and_then(Value::as_bool)
                 .unwrap_or(false)
         });
-        return gateway_readiness_result(ready, &status);
+        gateway_readiness_result(ready, &status)?;
+        return Ok(status);
     }
 
     Err(
@@ -5826,7 +6522,7 @@ mod tests {
         UpgradeSimulationSummary, candidate_codex_preflight_is_unsupported,
         command_output_reports_unsupported_command, parse_openclaw_finalize_phases,
         record_simulation_cleanup_failure, release_version_from_output,
-        simulation_requires_attention, summarize_command_failure_text,
+        simulation_requires_attention, summarize_command_failure_text, verify_gateway_build_id,
         verify_gateway_status_readiness, version_output_matches_expected,
     };
 
@@ -5939,6 +6635,32 @@ mod tests {
             release_version_from_output("OpenClaw current-main", Some("2026.7.2")).as_deref(),
             None
         );
+    }
+
+    #[test]
+    fn gateway_build_identity_uses_build_id_instead_of_overridable_version() {
+        let status = serde_json::json!({"rpc": {"ok": true, "server": {
+            "version": "overridden-version", "buildId": "candidate-build"
+        }}});
+        assert_eq!(
+            verify_gateway_build_id(&status, "candidate-build").unwrap(),
+            "running Gateway build matches the selected OpenClaw artifact"
+        );
+        assert!(verify_gateway_build_id(&status, "another-build").is_err());
+    }
+
+    #[test]
+    fn gateway_build_identity_preserves_legacy_and_auth_only_status() {
+        for status in [
+            serde_json::json!({"rpc": {"ok": true}}),
+            serde_json::json!({"rpc": {"ok": false, "error": "device identity required"}}),
+            serde_json::json!({"rpc": {"ok": true, "server": {"buildId": null}}}),
+        ] {
+            assert_eq!(
+                verify_gateway_build_id(&status, "candidate-build").unwrap(),
+                "running Gateway build identity unavailable"
+            );
+        }
     }
 
     #[test]
@@ -6071,13 +6793,68 @@ mod tests {
 
     #[test]
     fn codex_candidate_probe_only_skips_explicit_unsupported_results() {
+        let complete = serde_json::json!({
+            "ok": false,
+            "checksRun": 0,
+            "checksSkipped": 4,
+            "findings": [{
+                "checkId": "core/doctor/lint-selection",
+                "path": "codex/managed-app-server",
+                "severity": "error",
+                "message": "Unknown health check id selected by --only: codex/managed-app-server."
+            }]
+        });
+        let mirrored = "Doctor lint error [core/doctor/lint-selection]: Unknown health check id selected by --only: codex/managed-app-server.\n";
         assert!(candidate_codex_preflight_is_unsupported(
-            r#"{"findings":[{"checkId":"core/doctor/lint-selection","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            &complete.to_string(),
+            mirrored
+        ));
+        for stderr in [
+            format!("{mirrored}fatal: staged runtime could not load its configuration"),
+            format!("fatal: staged runtime could not load its configuration\n{mirrored}"),
+            mirrored.replace("lint-selection", "final-config-validation"),
+            mirrored.replace("error", "warning"),
+        ] {
+            assert!(!candidate_codex_preflight_is_unsupported(
+                &complete.to_string(),
+                &stderr
+            ));
+        }
+        assert!(!candidate_codex_preflight_is_unsupported("", mirrored));
+        for field in ["ok", "checksRun", "checksSkipped"] {
+            let mut incomplete = complete.clone();
+            incomplete.as_object_mut().unwrap().remove(field);
+            assert!(
+                !candidate_codex_preflight_is_unsupported(&incomplete.to_string(), ""),
+                "accepted missing {field}"
+            );
+        }
+        let mut incomplete = complete;
+        incomplete["findings"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("severity");
+        assert!(!candidate_codex_preflight_is_unsupported(
+            &incomplete.to_string(),
             ""
         ));
         assert!(candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        for checks_skipped in [0, 4] {
+            let output = format!(
+                r#"{{"ok":false,"checksRun":0,"checksSkipped":{checks_skipped},"findings":[{{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}}]}}"#
+            );
+            assert!(candidate_codex_preflight_is_unsupported(&output, ""));
+        }
+        assert!(candidate_codex_preflight_is_unsupported(
             "",
             "error: unknown option '--lint'"
+        ));
+        assert!(candidate_codex_preflight_is_unsupported(
+            "",
+            "error: unknown option '--lint'\n\nUsage: openclaw doctor [options]"
         ));
         assert!(!candidate_codex_preflight_is_unsupported(
             r#"{"findings":[{"checkId":"codex/managed-app-server","path":"/candidate/codex","message":"version mismatch"}]}"#,
@@ -6086,6 +6863,34 @@ mod tests {
         assert!(!candidate_codex_preflight_is_unsupported(
             "",
             "managed Codex binary command not found"
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."},{"checkId":"core/doctor/final-config-validation","severity":"error","message":"Invalid configuration"}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server; invalid configuration"}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":true,"checksRun":1,"checksSkipped":0,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":"4","findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"findings":[{"checkId":"core/doctor/lint-selection","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]"#,
+            ""
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            r#"{"ok":false,"checksRun":0,"checksSkipped":1,"findings":[{"checkId":"core/doctor/lint-selection","severity":"error","path":"codex/managed-app-server","message":"Unknown health check id selected by --only: codex/managed-app-server."}]}"#,
+            "fatal: staged runtime could not load its configuration"
+        ));
+        assert!(!candidate_codex_preflight_is_unsupported(
+            "",
+            "error: unknown option '--lint'\nfatal: staged runtime could not load its configuration"
         ));
     }
 }

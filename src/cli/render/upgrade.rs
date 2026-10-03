@@ -79,7 +79,14 @@ pub fn upgrade_env(
                 ),
             ),
             KeyValueRow::plain(
-                "Now using",
+                if matches!(
+                    summary.outcome.as_str(),
+                    "failed" | "rolled-back" | "rollback-failed"
+                ) {
+                    "Target"
+                } else {
+                    "Now using"
+                },
                 format!("{}:{}", summary.binding_kind, summary.binding_name),
             ),
             KeyValueRow::new("OpenClaw", &summary.outcome, outcome_tone(&summary.outcome)),
@@ -113,6 +120,19 @@ pub fn upgrade_env(
         lines.extend(render_key_value_card(
             "Release",
             &release_rows,
+            profile.color,
+        ));
+    }
+
+    if let Some(source) = &summary.source {
+        lines.push(String::new());
+        let rows = source_fields(source)
+            .into_iter()
+            .map(|(name, value)| KeyValueRow::plain(name, value))
+            .collect::<Vec<_>>();
+        lines.extend(render_key_value_card(
+            "Source observations (execution unsupported)",
+            &rows,
             profile.color,
         ));
     }
@@ -290,6 +310,20 @@ pub fn upgrade_batch(
         ],
         profile.color,
     ));
+    for result in &summary.results {
+        if let Some(source) = &result.source {
+            let rows = source_fields(source)
+                .into_iter()
+                .map(|(name, value)| KeyValueRow::plain(name, value))
+                .collect::<Vec<_>>();
+            lines.push(String::new());
+            lines.extend(render_key_value_card(
+                &format!("{} source (execution unsupported)", result.env_name),
+                &rows,
+                profile.color,
+            ));
+        }
+    }
     if !wide {
         lines.push(String::new());
         lines.push(paint(
@@ -653,7 +687,65 @@ fn upgrade_env_raw(summary: &UpgradeEnvSummary) -> Vec<String> {
     if let Some(note) = summary.note.as_deref() {
         bits.push(format!("note={note}"));
     }
+    if let Some(source) = &summary.source {
+        bits.extend(
+            source_fields(source)
+                .into_iter()
+                .map(|(name, value)| format!("{name}={value}")),
+        );
+    }
     vec![bits.join("  ")]
+}
+
+fn source_fields(
+    source: &crate::cli::upgrade::source::SourceInspection,
+) -> Vec<(&'static str, String)> {
+    let mut fields = vec![
+        ("sourceRoot", source.root.clone()),
+        (
+            "sourceHead",
+            source.head.clone().unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "builtCommit",
+            source
+                .built_commit
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "builtVersion",
+            source
+                .built_version
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+        ),
+        (
+            "buildMatchesHead",
+            source
+                .build_matches_head
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        ),
+        (
+            "workingTreeClean",
+            source
+                .working_tree_clean
+                .map_or_else(|| "unknown".to_string(), |value| value.to_string()),
+        ),
+    ];
+    if let Some(tracking) = &source.tracking_ref {
+        fields.push(("trackingRef", tracking.clone()));
+    }
+    if let Some(head) = &source.tracking_head {
+        fields.push(("trackingHead", head.clone()));
+    }
+    if !source.shared_environments.is_empty() {
+        fields.push(("sharedEnvironments", source.shared_environments.join(", ")));
+    }
+    if !source.issues.is_empty() {
+        fields.push(("sourceIssues", source.issues.join("; ")));
+    }
+    fields
 }
 
 fn upgrade_rollback_raw(summary: &UpgradeRollbackSummary) -> Vec<String> {
@@ -800,7 +892,7 @@ fn upgrade_simulation_batch_raw(summary: &UpgradeSimulationBatchSummary) -> Vec<
 
 fn outcome_tone(outcome: &str) -> Tone {
     match outcome {
-        "updated" | "switched" => Tone::Success,
+        "updated" | "source-updated" | "switched" => Tone::Success,
         "would-update" | "would-switch" => Tone::Accent,
         "up-to-date" => Tone::Accent,
         "pinned" | "local-command" | "manual-runtime" => Tone::Warning,

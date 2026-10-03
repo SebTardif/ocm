@@ -14,6 +14,7 @@ use std::thread::sleep;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
 use crate::env::EnvironmentService;
@@ -67,6 +68,9 @@ const SERVICE_PROXY_ENV_KEYS: [&str; 8] = [
     "all_proxy",
 ];
 const SERVICE_EXTRA_ENV_KEYS: [&str; 2] = ["NODE_EXTRA_CA_CERTS", "NODE_USE_SYSTEM_CA"];
+// Native CLIs use the account name to find their existing login (for example,
+// Claude's macOS Keychain account). Keep it across both service boundaries.
+const SERVICE_USER_ENV_KEYS: [&str; 2] = ["USER", "LOGNAME"];
 const SUPERVISED_CHILD_BASE_ENV_KEYS: [&str; 5] = ["HOME", "PATH", "OCM_HOME", "OCM_SELF", "SHELL"];
 const SUPERVISED_CHILD_RUNTIME_ENV_KEYS: [&str; 4] =
     ["NODE_OPTIONS", "NODE_ENV", "NODE_PATH", "PNPM_HOME"];
@@ -93,7 +97,33 @@ pub struct SupervisorChildSpec {
     pub child_port: u32,
     pub stdout_path: String,
     pub stderr_path: String,
+    #[serde(deserialize_with = "deserialize_supervisor_child_env")]
     pub process_env: BTreeMap<String, String>,
+}
+
+impl SupervisorChildSpec {
+    pub(crate) fn launch_spec_sha256(&self) -> Option<String> {
+        serde_json::to_vec(self).ok().map(|bytes| {
+            Sha256::digest(bytes)
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect()
+        })
+    }
+}
+
+fn deserialize_supervisor_child_env<'de, D>(
+    deserializer: D,
+) -> Result<BTreeMap<String, String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut env = BTreeMap::<String, String>::deserialize(deserializer)?;
+    // The executable is supplied by the spawning daemon; the retired capability
+    // advertisement must not survive plans written by an older CLI.
+    env.remove("OCM_SELF");
+    env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
+    Ok(env)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -190,6 +220,8 @@ pub struct SupervisorRunSummary {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SupervisorRuntimeChild {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_spec_sha256: Option<String>,
     pub env_name: String,
     pub binding_kind: String,
     pub binding_name: String,
@@ -281,19 +313,6 @@ pub struct SupervisorInspection {
 pub struct SupervisorService<'a> {
     env: &'a BTreeMap<String, String>,
     cwd: &'a Path,
-}
-
-pub fn sync_supervisor_if_present(
-    env: &BTreeMap<String, String>,
-    cwd: &Path,
-) -> Result<bool, String> {
-    let state_path = supervisor_state_path(env, cwd)?;
-    let runtime_path = supervisor_runtime_path(env, cwd)?;
-    if !state_path.exists() && !runtime_path.exists() {
-        return Ok(false);
-    }
-    SupervisorService::new(env, cwd).sync()?;
-    Ok(true)
 }
 
 pub fn sync_supervisor_env_if_present(
@@ -425,6 +444,68 @@ impl<'a> SupervisorService<'a> {
             updated_at: runtime.updated_at,
             children: runtime.children,
         })
+    }
+
+    /// Compare the applied child with the canonical current plan.
+    /// Mutation decisions must retain their environment operation lock.
+    pub(crate) fn running_launch_matches(&self, env_name: &str, pid: u32) -> Result<bool, String> {
+        let Some(observed) = self.live_runtime_state()? else {
+            return Ok(false);
+        };
+        let Some(child) = observed
+            .children
+            .iter()
+            .find(|child| child.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(running) = observed
+            .services
+            .iter()
+            .find(|entry| entry.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired) = self
+            .plan()?
+            .children
+            .into_iter()
+            .find(|spec| spec.env_name == env_name)
+        else {
+            return Ok(false);
+        };
+        let Some(desired_digest) = desired.launch_spec_sha256() else {
+            return Ok(false);
+        };
+        Ok(
+            child.launch_spec_sha256.as_deref() == Some(desired_digest.as_str())
+                && child.pid == pid
+                && child.binding_kind == desired.binding_kind
+                && child.binding_name == desired.binding_name
+                && running.pid == Some(pid)
+                && running.binding_kind == desired.binding_kind
+                && running.binding_name == desired.binding_name
+                && running.gateway_state == "running",
+        )
+    }
+
+    /// Confirm absence through the owned daemon's observations, not desired flags.
+    /// Mutation decisions must retain the environment operation lock.
+    pub(crate) fn stopped_launch_observed(&self, env_name: &str) -> Result<bool, String> {
+        let observed = self.live_runtime_state()?;
+        if observed.is_none() && self.daemon_status()?.running {
+            return Ok(false);
+        }
+        Ok(observed.is_none_or(|observed| {
+            !observed
+                .children
+                .iter()
+                .any(|child| child.env_name == env_name)
+                && !observed
+                    .services
+                    .iter()
+                    .any(|entry| entry.env_name == env_name && entry.pid.is_some())
+        }))
     }
 
     pub fn inspect(&self) -> Result<SupervisorInspection, String> {
@@ -663,7 +744,9 @@ impl<'a> SupervisorService<'a> {
         ensure_store(self.env, self.cwd)?;
         let ocm_home = resolve_ocm_home(self.env, self.cwd)?;
         let logs_dir = supervisor_logs_dir(self.env, self.cwd)?;
-        let env_service = EnvironmentService::new(self.env, self.cwd);
+        let mut child_env = self.env.clone();
+        child_env.insert("OCM_HOME".into(), display_path(&ocm_home));
+        let env_service = EnvironmentService::new(&child_env, self.cwd);
         let mut envs = list_environments(self.env, self.cwd)?;
         envs.sort_by(|left, right| left.name.cmp(&right.name));
         let envs = env_service.apply_effective_gateway_ports(envs)?;
@@ -1220,6 +1303,7 @@ fn try_lock_supervisor_state(
 
 struct RunningSupervisorChild {
     spec: SupervisorChildSpec,
+    launch_spec_sha256: Option<String>,
     child: Child,
     restart_count: usize,
     quick_clean_restart_count: usize,
@@ -1289,6 +1373,7 @@ fn spawn_running_child(
     );
     Ok(RunningSupervisorChild {
         child: spawn_supervisor_child(&prepared_spec)?,
+        launch_spec_sha256: spec.launch_spec_sha256(),
         spec,
         restart_count,
         quick_clean_restart_count,
@@ -1332,9 +1417,17 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
             )
         })?;
     let mut process_env = spec.process_env.clone();
+    // Bind clients to the actual spawning daemon, not the CLI that last
+    // regenerated the desired spec (which must not restart a running Gateway).
+    #[cfg(unix)]
+    {
+        let executable = std::env::current_exe().map_err(|error| error.to_string())?;
+        process_env.insert("OCM_SELF".into(), display_path(&executable));
+    }
+
     process_env.insert(
         "TMPDIR".to_string(),
-        display_path(&prepare_supervisor_child_tmpdir()?),
+        display_path(&prepare_supervisor_child_tmpdir(spec)?),
     );
 
     let mut command = Command::new(program);
@@ -1346,6 +1439,15 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
         .env_clear()
         .envs(&process_env)
         .current_dir(Path::new(&spec.run_dir));
+    #[cfg(target_os = "linux")]
+    for key in ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"] {
+        // Native user-service commands need the spawning daemon's session,
+        // not a caller's transient connection saved in the desired spec.
+        command.env_remove(key);
+        if let Some(value) = std::env::var_os(key) {
+            command.env(key, value);
+        }
+    }
     #[cfg(unix)]
     {
         command.process_group(0);
@@ -1359,21 +1461,19 @@ fn spawn_supervisor_child(spec: &SupervisorChildSpec) -> Result<Child, String> {
     })
 }
 
-fn prepare_supervisor_child_tmpdir() -> Result<PathBuf, String> {
-    let preferred = std::env::var_os("TMPDIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute() && path.is_dir());
-    if let Some(preferred) = preferred
-        && let Ok(path) = ensure_supervisor_child_tmpdir(&preferred)
-    {
-        return Ok(path);
-    }
-
-    #[cfg(unix)]
-    let fallback = PathBuf::from("/tmp");
-    #[cfg(not(unix))]
-    let fallback = std::env::temp_dir();
-    ensure_supervisor_child_tmpdir(&fallback)
+fn prepare_supervisor_child_tmpdir(spec: &SupervisorChildSpec) -> Result<PathBuf, String> {
+    let state_dir = spec
+        .process_env
+        .get("OPENCLAW_STATE_DIR")
+        .map(String::as_str)
+        .filter(|path| !path.trim().is_empty())
+        .ok_or_else(|| {
+            format!(
+                "service child env \"{}\" is missing OPENCLAW_STATE_DIR",
+                spec.env_name
+            )
+        })?;
+    ensure_supervisor_child_tmpdir(Path::new(state_dir))
 }
 
 fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
@@ -1384,7 +1484,7 @@ fn ensure_supervisor_child_tmpdir(base: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let path = base.join(format!("ocm-supervisor-{}", std::process::id()));
+    let path = base.join("tmp");
     match fs::create_dir(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -2571,7 +2671,10 @@ fn supervisor_service_environment(
             service_env.insert(key.to_string(), value.trim().to_string());
         }
     }
-    for key in SERVICE_EXTRA_ENV_KEYS {
+    for key in SERVICE_EXTRA_ENV_KEYS
+        .into_iter()
+        .chain(SERVICE_USER_ENV_KEYS)
+    {
         if let Some(value) = process_env
             .get(key)
             .filter(|value| !value.trim().is_empty())
@@ -2801,6 +2904,8 @@ fn build_supervised_openclaw_env(
     process_env: BTreeMap<String, String>,
 ) -> BTreeMap<String, String> {
     let mut process_env = stable_supervised_child_env(process_env);
+    process_env.remove("OCM_SELF");
+    process_env.remove("OPENCLAW_OCM_UPDATE_PROTOCOL");
     apply_external_supervision_hint(&mut process_env);
     process_env
 }
@@ -2830,6 +2935,7 @@ fn stable_supervised_child_env_key(key: &str) -> bool {
         || key.starts_with("npm_config_")
         || key.starts_with("COREPACK_")
         || SUPERVISED_CHILD_BASE_ENV_KEYS.contains(&key)
+        || SERVICE_USER_ENV_KEYS.contains(&key)
         || SUPERVISED_CHILD_RUNTIME_ENV_KEYS.contains(&key)
         || SERVICE_PROXY_ENV_KEYS.contains(&key)
         || SERVICE_EXTRA_ENV_KEYS.contains(&key)
@@ -2919,6 +3025,7 @@ fn write_supervisor_runtime_state(
 
 fn supervisor_runtime_child(running_child: &RunningSupervisorChild) -> SupervisorRuntimeChild {
     SupervisorRuntimeChild {
+        launch_spec_sha256: running_child.launch_spec_sha256.clone(),
         env_name: running_child.spec.env_name.clone(),
         binding_kind: running_child.spec.binding_kind.clone(),
         binding_name: running_child.spec.binding_name.clone(),
@@ -3013,6 +3120,44 @@ mod tests {
             skipped_envs: Vec::new(),
             restart_requests,
         }
+    }
+
+    #[test]
+    fn supervised_children_use_their_environment_temp_root() {
+        let root = tempfile::tempdir().unwrap();
+        let first_state = root.path().join("first/.openclaw");
+        let second_state = root.path().join("second/.openclaw");
+        fs::create_dir_all(&first_state).unwrap();
+        fs::create_dir_all(&second_state).unwrap();
+
+        let mut first = child_spec("first", 19_999);
+        first
+            .process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&first_state));
+        let mut second = child_spec("second", 20_000);
+        second.process_env.insert(
+            "OPENCLAW_STATE_DIR".to_string(),
+            display_path(&second_state),
+        );
+
+        let first_tmp = prepare_supervisor_child_tmpdir(&first).unwrap();
+        let second_tmp = prepare_supervisor_child_tmpdir(&second).unwrap();
+        assert_eq!(first_tmp, first_state.join("tmp"));
+        assert_eq!(second_tmp, second_state.join("tmp"));
+        assert_ne!(first_tmp, second_tmp);
+        assert!(first_tmp.is_dir());
+        assert!(second_tmp.is_dir());
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(first_tmp).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+    }
+
+    #[test]
+    fn supervised_child_temp_root_requires_managed_state_dir() {
+        let error = prepare_supervisor_child_tmpdir(&child_spec("demo", 19_999)).unwrap_err();
+        assert!(error.contains("missing OPENCLAW_STATE_DIR"));
     }
 
     #[test]
@@ -3507,6 +3652,8 @@ mod tests {
             now_millis()
         ));
         fs::create_dir_all(&test_dir).unwrap();
+        let state_dir = test_dir.join(".openclaw");
+        fs::create_dir(&state_dir).unwrap();
         let descendant_pid_path = test_dir.join("descendant.pid");
         let mut spec = child_spec("process-group-cleanup", 19_999);
         spec.command = Some(
@@ -3521,6 +3668,8 @@ mod tests {
             "OCM_TEST_DESCENDANT_PID_FILE".to_string(),
             descendant_pid_path.to_string_lossy().into_owned(),
         );
+        spec.process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
 
         let support = probe_restart_handoff_support(&spec);
         let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
@@ -3564,12 +3713,16 @@ mod tests {
             now_millis()
         ));
         fs::create_dir_all(&test_dir).unwrap();
+        let state_dir = test_dir.join(".openclaw");
+        fs::create_dir(&state_dir).unwrap();
         let mut spec = child_spec("process-group-leader-reap", 19_998);
         spec.command = Some("trap 'exit 0' TERM; while :; do sleep 1; done".to_string());
         spec.binary_path = None;
         spec.run_dir = test_dir.to_string_lossy().into_owned();
         spec.stdout_path = test_dir.join("stdout.log").to_string_lossy().into_owned();
         spec.stderr_path = test_dir.join("stderr.log").to_string_lossy().into_owned();
+        spec.process_env
+            .insert("OPENCLAW_STATE_DIR".to_string(), display_path(&state_dir));
 
         let support = probe_restart_handoff_support(&spec);
         let mut running_child = spawn_running_child(spec, 0, 0, support).unwrap();
@@ -3717,6 +3870,7 @@ mod tests {
             let mut running = RunningFixture(BTreeMap::from([(
                 "demo".to_string(),
                 RunningSupervisorChild {
+                    launch_spec_sha256: original.launch_spec_sha256(),
                     spec: original.clone(),
                     child,
                     restart_count: 0,
@@ -3762,6 +3916,14 @@ mod tests {
             let owner = running.0.get_mut("demo").unwrap();
             assert_eq!(owner.child.id(), pid);
             assert!(owner.child.try_wait().unwrap().is_none());
+            let observed = supervisor_runtime_child(owner);
+            assert_eq!(observed.launch_spec_sha256, original.launch_spec_sha256());
+            if change == "changed" {
+                assert_ne!(
+                    observed.launch_spec_sha256,
+                    next.children[0].launch_spec_sha256()
+                );
+            }
             let saved: SupervisorState = read_json(&state_path).unwrap();
             assert!(supervisor_state_equivalent(&saved, &next));
             drop(state_lock);
@@ -3771,10 +3933,12 @@ mod tests {
                 let (started_tx, started_rx) = std::sync::mpsc::channel();
                 let (lease_tx, lease_rx) = std::sync::mpsc::channel();
                 let service = &service;
+                let source_root = root.path();
                 let worker = scope.spawn(move || {
                     started_tx.send(()).unwrap();
                     let lease = service.acquire_source_watch_lease(
                         "demo",
+                        source_root,
                         false,
                         crate::env::SourceWatchMode::ServicePreparation,
                     );
@@ -4091,6 +4255,36 @@ mod tests {
         assert!(!process_env.contains_key("OPENCLAW_LAUNCHD_LABEL"));
         assert!(!process_env.contains_key("OPENCLAW_SYSTEMD_UNIT"));
         assert!(!process_env.contains_key("OPENCLAW_WINDOWS_TASK_NAME"));
+    }
+
+    #[test]
+    fn service_environments_preserve_only_nonempty_user_identity() {
+        for (user, logname) in [(" fixture-user ", "fixture-login"), (" ", "")] {
+            let env = BTreeMap::from([
+                ("USER".to_string(), user.to_string()),
+                ("LOGNAME".to_string(), logname.to_string()),
+                ("GH_TOKEN".to_string(), "fixture-token".to_string()),
+                ("LD_PRELOAD".to_string(), "fixture.so".to_string()),
+                (
+                    "DYLD_INSERT_LIBRARIES".to_string(),
+                    "fixture.dylib".to_string(),
+                ),
+            ]);
+            for actual in [
+                supervisor_service_environment(&env, Path::new("/fixture"), Path::new("/bin/ocm")),
+                build_supervised_openclaw_env(env),
+            ] {
+                for (key, value) in [("USER", user), ("LOGNAME", logname)] {
+                    assert_eq!(
+                        actual.get(key).map(String::as_str),
+                        (!value.trim().is_empty()).then_some(value.trim())
+                    );
+                }
+                for excluded in ["GH_TOKEN", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"] {
+                    assert!(!actual.contains_key(excluded));
+                }
+            }
+        }
     }
 
     #[test]

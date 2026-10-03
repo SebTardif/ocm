@@ -1789,10 +1789,12 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
 
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let during = wait_for_runtime_children(&runtime_path, 1, Some("prod"), Duration::from_secs(5));
+    // The supervisor publishes the PID before the child's first write completes.
+    let sibling_was_started = wait_for_file(&runtime_marker, Duration::from_secs(5));
     let source_was_started = launcher_marker.exists();
-    let sibling_was_started = runtime_marker.exists();
     drop(source_watch);
     let after = wait_for_runtime_children(&runtime_path, 2, Some("demo"), Duration::from_secs(10));
+    let source_was_resumed = wait_for_file(&launcher_marker, Duration::from_secs(5));
     stop_process(&mut daemon);
 
     assert!(during.is_some(), "unwatched sibling should remain runnable");
@@ -1802,7 +1804,10 @@ fn daemon_defers_a_saved_service_start_until_source_watch_releases_the_env() {
         after.is_some(),
         "service did not resume after watch released"
     );
-    assert!(launcher_marker.exists());
+    assert!(
+        source_was_resumed,
+        "resumed child did not write its startup marker"
+    );
 }
 
 #[test]
@@ -2149,6 +2154,52 @@ fn start_create_preserves_running_siblings_despite_caller_environment_drift() {
     );
 
     stop_process(&mut daemon);
+}
+
+#[test]
+fn service_policy_changes_preserve_unrelated_supervisor_child_specs() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-policy-preserves-supervisor-siblings");
+    let (cwd, mut env) = setup_service_fixture(&root);
+    let state_path = root.child("ocm-home/supervisor/state.json");
+    SupervisorService::new(&env, &cwd).sync().unwrap();
+    let sibling = persisted_child(&state_path, "prod");
+    env.insert(
+        "NODE_OPTIONS".to_string(),
+        "--max-old-space-size=2048".to_string(),
+    );
+
+    // Simulation repeats an already-disabled policy; that must remain target-scoped too.
+    for (enabled_option, running_option, enabled, running) in [
+        (Some(false), None, false, true),
+        (None, Some(false), false, false),
+        (Some(false), Some(false), false, false),
+        (Some(true), None, true, false),
+        (None, Some(true), true, true),
+        (Some(true), Some(true), true, true),
+    ] {
+        let service = EnvironmentService::new(&env, &cwd);
+        let changed = match (enabled_option, running_option) {
+            (Some(enabled), None) => service.set_service_enabled("demo", enabled),
+            (None, Some(running)) => service.set_service_running("demo", running),
+            _ => service.set_service_policy("demo", enabled_option, running_option),
+        }
+        .unwrap();
+        assert_eq!(changed.service_enabled, enabled);
+        assert_eq!(changed.service_running, running);
+        assert_eq!(
+            persisted_child(&state_path, "prod"),
+            sibling,
+            "changing one environment's service policy rebuilt a sibling definition"
+        );
+        let state = read_persisted_service_state(&state_path);
+        let target_present = state["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|child| child["envName"] == "demo");
+        assert_eq!(target_present, enabled && running);
+    }
 }
 
 #[test]
@@ -2827,6 +2878,15 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
     let cwd = root.child("workspace");
     fs::create_dir_all(&cwd).unwrap();
     let mut env = ocm_env(&root);
+    env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    env.insert(
+        "XDG_RUNTIME_DIR".into(),
+        path_string(&root.child("daemon-session")),
+    );
+    env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/daemon-session/bus".into(),
+    );
     env.insert(
         "OCM_INTERNAL_SERVICE_MANAGER".to_string(),
         "launchd".to_string(),
@@ -2840,7 +2900,10 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         let runtime = root.child(format!("bin/{runtime_name}"));
         write_legacy_openclaw_script(
             &runtime,
-            "#!/bin/sh\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$OCM_SELF\" \"$OCM_HOME\" \"${{OPENCLAW_OCM_UPDATE_PROTOCOL-unset}}\" \"$XDG_RUNTIME_DIR\" \"$DBUS_SESSION_BUS_ADDRESS\" > '{}'\ntrap 'exit 0' TERM INT\nwhile :; do sleep 1; done\n",
+                root.child(format!("{env_name}-scope")).display()
+            ),
         );
         let add = run_ocm(
             &cwd,
@@ -2870,18 +2933,47 @@ fn service_start_preserves_running_siblings_despite_unrelated_drift() {
         "fixture must report the managed daemon as running: {daemon_status:?}"
     );
 
+    let mut legacy_state = read_persisted_service_state(&state_path);
+    for child in legacy_state["children"].as_array_mut().unwrap() {
+        child["processEnv"]["OCM_SELF"] = Value::String("/retired/caller/ocm".into());
+        child["processEnv"]["OPENCLAW_OCM_UPDATE_PROTOCOL"] = Value::String("stale".into());
+    }
+    write_persisted_service_state(&state_path, &legacy_state);
     let mut daemon = spawn_daemon_process(&cwd, &env);
     let initial_runtime = wait_for_runtime_children(&runtime_path, 2, None, Duration::from_secs(5))
         .expect("daemon runtime state did not report both children");
     let target_pid = runtime_child_pid(&initial_runtime, "target").unwrap();
     let sibling_pid = runtime_child_pid(&initial_runtime, "sibling").unwrap();
+    let scope_path = root.child("target-scope");
+    assert!(wait_for_file(&scope_path, Duration::from_secs(5)));
+    let scope = fs::read_to_string(&scope_path).unwrap();
+    let scope: Vec<_> = scope.lines().collect();
+    assert_eq!(
+        fs::canonicalize(scope[0]).unwrap(),
+        fs::canonicalize(support::ocm_test_binary_path()).unwrap()
+    );
+    assert_eq!(scope[1], env["OCM_HOME"]);
+    assert_eq!(scope[2], "unset");
+    #[cfg(target_os = "linux")]
+    {
+        assert_eq!(scope[3], env["XDG_RUNTIME_DIR"]);
+        assert_eq!(scope[4], env["DBUS_SESSION_BUS_ADDRESS"]);
+    }
 
     let sibling_meta_path = root.child("ocm-home/runtimes/sibling-runtime.json");
     let mut sibling_meta = read_persisted_service_state(&sibling_meta_path);
     sibling_meta["releaseVersion"] = Value::String("latent-sibling-v2".to_string());
     write_persisted_service_state(&sibling_meta_path, &sibling_meta);
 
-    let start = run_ocm(&cwd, &env, &["service", "start", "target", "--json"]);
+    let mut caller_env = env.clone();
+    caller_env.insert("OCM_SELF".into(), "/another/caller/ocm".into());
+    caller_env.insert("OPENCLAW_OCM_UPDATE_PROTOCOL".into(), "stale".into());
+    caller_env.insert("XDG_RUNTIME_DIR".into(), "/another/caller/session".into());
+    caller_env.insert(
+        "DBUS_SESSION_BUS_ADDRESS".into(),
+        "unix:path=/another/caller/bus".into(),
+    );
+    let start = run_ocm(&cwd, &caller_env, &["service", "start", "target", "--json"]);
     assert!(start.status.success(), "{}", stderr(&start));
     sleep(Duration::from_millis(800));
 
@@ -3361,6 +3453,44 @@ fn service_start_waits_for_slow_gateway_health() {
     assert_eq!(body["gatewayReady"], true);
 
     stop_process(&mut daemon);
+}
+
+#[cfg(unix)]
+#[test]
+fn service_start_preserves_quoted_shell_builtin_launchers() {
+    let _guard = daemon_runtime_test_lock();
+    let root = TestDir::new("service-readiness-quoted-builtin");
+    let (cwd, env) = setup_gateway_readiness_fixture(&root, "healthy", 0, 5_000);
+    let entry = root.child("Entrypoint With Spaces.mjs");
+    std::os::unix::fs::symlink(root.child("bin/readiness-openclaw.mjs"), &entry).unwrap();
+    let launcher = run_ocm(
+        &cwd,
+        &env,
+        &[
+            "launcher",
+            "add",
+            "quoted",
+            "--command",
+            &format!("exec \"node\" '{}'", path_string(&entry)),
+        ],
+    );
+    assert!(launcher.status.success(), "{}", stderr(&launcher));
+    let bound = run_ocm(&cwd, &env, &["env", "set-launcher", "demo", "quoted"]);
+    assert!(bound.status.success(), "{}", stderr(&bound));
+
+    let mut daemon = spawn_daemon_process(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+    // Reap the isolated supervisor and its child even if the readiness assertion fails.
+    stop_process(&mut daemon);
+    assert!(
+        started.status.success(),
+        "{}\n{}",
+        stdout(&started),
+        stderr(&started)
+    );
+    let body: Value = serde_json::from_slice(&started.stdout).unwrap();
+    assert_eq!(body["gatewayReady"], true);
+    assert_eq!(body["gatewayState"], "running");
 }
 
 #[test]

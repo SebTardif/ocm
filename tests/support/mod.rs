@@ -300,6 +300,12 @@ pub fn base_env(home: &Path) -> BTreeMap<String, String> {
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_string(), path);
     }
+    #[cfg(windows)]
+    {
+        // Windows system DLLs still need SystemRoot in an isolated environment.
+        let system_root = std::env::var("SystemRoot").expect("Windows fixture requires SystemRoot");
+        env.insert("SystemRoot".to_string(), system_root);
+    }
     env
 }
 
@@ -405,7 +411,7 @@ pub fn npm_fixture(package: &Path) -> Option<(PathBuf, PathBuf)> {
     );
     let binary = payload.join(format!("vendor/{target}/bin/ocm"));
     fs::create_dir_all(binary.parent().unwrap()).unwrap();
-    fs::hard_link(ocm_test_binary_path(), &binary).unwrap();
+    fs::copy(ocm_test_binary_path(), &binary).unwrap();
     let entrypoint = package.join("bin/ocm.cjs");
     write_executable_script(&entrypoint, include_str!("../../npm/ocm.cjs"));
     Some((entrypoint, binary))
@@ -655,6 +661,9 @@ if [ "$1" = "--version" ]; then
   printf '10.0.0\n'
   exit 0
 fi
+if [ -n "${OCM_TEST_NPM_LIFECYCLE_PROBE:-}" ]; then
+  "$OCM_TEST_NPM_LIFECYCLE_PROBE"
+fi
 
 prefix=""
 archive=""
@@ -771,6 +780,9 @@ case "$script" in
         echo "managed npm lifecycle PATH resolved node to ${{resolved_node:-missing}}, expected $0" >&2
         exit 1
       fi
+    fi
+    if [ -n "${{OCM_TEST_NPM_LIFECYCLE_PROBE:-}}" ]; then
+      "$OCM_TEST_NPM_LIFECYCLE_PROBE"
     fi
     prefix=""
     archive=""

@@ -126,6 +126,7 @@ fn setup_gateway_aware_restart_fixture(
             next_retry_at: None,
         }],
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "launcher".to_string(),
             binding_name: "stable".to_string(),
@@ -348,6 +349,61 @@ fn service_install_enables_the_env_and_installs_the_ocm_service() {
             & 0o777,
         0o700
     );
+}
+
+#[test]
+fn service_start_preserves_native_cli_identity_across_service_boundaries() {
+    for systemd in [false, true] {
+        let root = TestDir::new("service-native-cli-identity");
+        let cwd = root.child("workspace");
+        fs::create_dir_all(&cwd).unwrap();
+        let mut env = if systemd {
+            systemd_env(&root)
+        } else {
+            launchd_env(&root)
+        };
+        env.insert("USER".to_string(), "fixture-user".to_string());
+        env.insert("LOGNAME".to_string(), "fixture-user".to_string());
+        env.insert("GH_TOKEN".to_string(), "fixture-token".to_string());
+        env.insert(
+            "CODEX_SESSION_ID".to_string(),
+            "fixture-session".to_string(),
+        );
+        let marker = root.child("native-cli-identity.txt");
+        write_executable_script(
+            &root.child("fake-bin/openclaw"),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"${{USER-unset}}:${{LOGNAME-unset}}:${{GH_TOKEN-unset}}:${{CODEX_SESSION_ID-unset}}\" > '{}'\n",
+                path_string(&marker)
+            ),
+        );
+        setup_launcher_env(&cwd, &env);
+        let started = run_ocm(&cwd, &env, &["service", "start", "demo", "--json"]);
+        assert!(started.status.success(), "{}", stderr(&started));
+
+        let definition =
+            fs::read_to_string(managed_service_definition_path(&env, &cwd, "ocm")).unwrap();
+        for key in ["USER", "LOGNAME"] {
+            let expected = if systemd {
+                format!("Environment=\"{key}=fixture-user\"")
+            } else {
+                format!("<key>{key}</key>\n      <string>fixture-user</string>")
+            };
+            assert!(definition.contains(&expected), "{definition}");
+        }
+        assert!(!definition.contains("fixture-token"));
+        assert!(!definition.contains("fixture-session"));
+
+        // The daemon must launch with the saved identity, not an ambient shell's.
+        env.remove("USER");
+        env.remove("LOGNAME");
+        let run = run_ocm(&cwd, &env, &["__daemon", "run", "--once", "--json"]);
+        assert!(run.status.success(), "{}", stderr(&run));
+        assert_eq!(
+            fs::read_to_string(&marker).unwrap(),
+            "fixture-user:fixture-user:unset:unset\n"
+        );
+    }
 }
 
 #[test]
@@ -658,6 +714,53 @@ fn service_stop_keeps_the_daemon_while_a_sibling_env_is_running() {
     let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo", "--json"]);
     assert!(stopped.status.success(), "{}", stderr(&stopped));
     assert!(managed_service_definition_path(&env, &cwd, "ocm").exists());
+}
+
+#[test]
+fn service_start_accepts_reformatted_same_store_plist() {
+    let root = TestDir::new("service-start-reformatted-owner");
+    let cwd = root.child("workspace");
+    fs::create_dir_all(&cwd).unwrap();
+    let env = launchd_env(&root);
+    setup_launcher_env(&cwd, &env);
+    let started = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(started.status.success(), "{}", stderr(&started));
+
+    let path = managed_service_definition_path(&env, &cwd, "ocm");
+    let original = fs::read_to_string(&path).unwrap();
+    let reformatted = original.replace("      <string>", "\t<string>");
+    assert_ne!(original, reformatted);
+    fs::write(&path, &reformatted).unwrap();
+    #[cfg(target_os = "macos")]
+    {
+        let edited = Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Set :Comment reformatted-owner-fixture"])
+            .arg(&path)
+            .output()
+            .unwrap();
+        assert!(edited.status.success(), "{}", stderr(&edited));
+    }
+    let restarted = run_ocm(&cwd, &env, &["service", "start", "demo"]);
+    assert!(restarted.status.success(), "{}", stderr(&restarted));
+
+    let mut foreign_env = env.clone();
+    foreign_env.insert(
+        "OCM_HOME".to_string(),
+        path_string(&root.child("foreign-store")),
+    );
+    setup_launcher_env(&cwd, &foreign_env);
+    let before = fs::read(&path).unwrap();
+    let rejected = run_ocm(&cwd, &foreign_env, &["service", "start", "demo"]);
+    assert!(!rejected.status.success());
+    assert!(
+        stderr(&rejected).contains("already bound to a different OCM_HOME"),
+        "{}",
+        stderr(&rejected)
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+
+    let stopped = run_ocm(&cwd, &env, &["service", "stop", "demo"]);
+    assert!(stopped.status.success(), "{}", stderr(&stopped));
 }
 
 #[test]
@@ -1250,6 +1353,7 @@ fn service_status_ignores_stale_runtime_children_when_the_daemon_is_down() {
         updated_at: now_utc(),
         services: Vec::new(),
         children: vec![SupervisorRuntimeChild {
+            launch_spec_sha256: None,
             env_name: "demo".to_string(),
             binding_kind: "launcher".to_string(),
             binding_name: "stable".to_string(),

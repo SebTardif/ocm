@@ -1,5 +1,5 @@
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -13,7 +13,6 @@ use crate::infra::archive::{
     ArchivedEnvMeta, EnvArchiveMetadata, extract_env_archive, write_env_archive_with_options,
 };
 use crate::openclaw_repo::remove_openclaw_worktree;
-use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 
 #[cfg(unix)]
@@ -96,17 +95,8 @@ fn write_env_registry(
     write_json(&path, &registry)
 }
 
-pub(crate) struct EnvRegistryLock {
-    file: File,
-}
-
+pub(crate) type EnvRegistryLock = super::common::ExclusiveFileLock;
 pub(crate) type EnvironmentOperationLock = super::common::ExclusiveFileLock;
-
-impl Drop for EnvRegistryLock {
-    fn drop(&mut self) {
-        let _ = FileExt::unlock(&self.file);
-    }
-}
 
 pub(super) fn environment_operation_lock_path(
     name: &str,
@@ -134,7 +124,7 @@ pub(crate) fn lock_environment_operation(
     )
 }
 
-pub(super) fn try_lock_environment_operation(
+pub(crate) fn try_lock_environment_operation(
     name: &str,
     env: &BTreeMap<String, String>,
     cwd: &Path,
@@ -152,30 +142,10 @@ pub(crate) fn lock_env_registry(
     // Keep load/allocate/write under one cross-process lock. Locking only the
     // final rename loses concurrent entries and can assign duplicate ports.
     let registry_path = env_registry_path(env, cwd)?;
-    let parent = registry_path
-        .parent()
-        .ok_or_else(|| "environment registry has no parent directory".to_string())?;
-    ensure_dir(parent)?;
-    let lock_path = registry_path.with_extension("lock");
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .map_err(|error| {
-            format!(
-                "failed to open environment registry lock {}: {error}",
-                display_path(&lock_path)
-            )
-        })?;
-    file.lock_exclusive().map_err(|error| {
-        format!(
-            "failed to lock environment registry {}: {error}",
-            display_path(&lock_path)
-        )
-    })?;
-    Ok(EnvRegistryLock { file })
+    super::lock_file(
+        &registry_path.with_extension("lock"),
+        "environment registry",
+    )
 }
 
 fn normalize_environment(mut meta: EnvMeta) -> Result<EnvMeta, String> {
@@ -421,6 +391,48 @@ pub fn create_environment(
     create_environment_with_runtime_validation(options, false, env, cwd)
 }
 
+fn ensure_root_outside_environments(
+    name: &str,
+    root: &Path,
+    envs: &[EnvMeta],
+) -> Result<(), String> {
+    if envs.is_empty() {
+        return Ok(());
+    }
+    let resolve = |root: &Path| {
+        super::dev_registration::registration_path(root).map_err(|error| {
+            format!(
+                "failed to resolve environment root {}: {error}",
+                display_path(root)
+            )
+        })
+    };
+    let (target, mut target_entries) = resolve(root)?;
+    target_entries.insert(target.clone());
+    for current in envs {
+        let (registered, mut registered_entries) = resolve(Path::new(&current.root))?;
+        registered_entries.insert(registered.clone());
+        // Compare both the resolved roots and the links that keep them reachable.
+        // A disjoint target reached through a link inside another root is unsafe too.
+        for (container, entries) in [
+            (&registered, &target_entries),
+            (&target, &registered_entries),
+        ] {
+            for entry in entries {
+                if super::dev_sources::projected_path_contains(container, entry)? {
+                    return Err(format!(
+                        "environment {name} root {} overlaps environment {} root {}; choose a separate environment root",
+                        display_path(root),
+                        current.name,
+                        current.root
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn create_environment_with_validated_runtime(
     options: CreateEnvironmentOptions,
     env: &BTreeMap<String, String>,
@@ -484,6 +496,7 @@ fn create_environment_with_runtime_validation(
             Path::new(source),
         )?;
     }
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let paths = derive_env_paths(&root);
     if path_exists(&paths.root) {
         let mut entries = fs::read_dir(&paths.root).map_err(|error| error.to_string())?;
@@ -610,6 +623,7 @@ fn clone_environment_with_policy(
         default_env_root(&name, env, cwd)?
     };
     ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+    ensure_root_outside_environments(&name, &root, &registry.envs)?;
     let target_paths = derive_env_paths(&root);
     if path_exists(&target_paths.root) {
         let mut entries = fs::read_dir(&target_paths.root).map_err(|error| error.to_string())?;
@@ -720,6 +734,9 @@ fn clone_environment_with_policy(
                 outcome
             }
         };
+
+        super::openclaw_state::relocate_cloned_plugin_index_paths(&source_paths, &target_paths)?;
+        super::openclaw_state::clear_cloned_agent_database_leases(&target_paths)?;
 
         let meta = EnvMeta {
             upgrade_independent_paths: Vec::new(),
@@ -988,6 +1005,7 @@ pub(crate) fn import_environment_with_sandbox_origin(
             default_env_root(&name, env, cwd)?
         };
         ensure_root_outside_dev_sources(&name, &root, &registry.envs)?;
+        ensure_root_outside_environments(&name, &root, &registry.envs)?;
         let target_paths = derive_env_paths(&root);
         if path_exists(&target_paths.root) {
             let mut entries =
@@ -1397,6 +1415,54 @@ mod tests {
         fs::write(source_paths.state_dir.join("logs/gateway.log"), "source\n").unwrap();
         fs::write(source_paths.state_dir.join("openclaw.json.bak"), "{}\n").unwrap();
 
+        let local_plugin = source_paths.root.join("local-plugin");
+        fs::create_dir_all(&local_plugin).unwrap();
+        fs::write(local_plugin.join("index.js"), "export default {};\n").unwrap();
+        let external_project = root.join("plugin-project");
+        fs::create_dir_all(&external_project).unwrap();
+        let database = source_paths.state_dir.join("state/openclaw.sqlite");
+        fs::create_dir_all(database.parent().unwrap()).unwrap();
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        connection.execute(
+            "CREATE TABLE config_machine_state (state_key TEXT PRIMARY KEY, value_json TEXT NOT NULL)",
+            [],
+        ).unwrap();
+        connection.execute(
+            "INSERT INTO config_machine_state (state_key, value_json) VALUES ('plugins.installedIndex', ?1)",
+            [json!({"revision": 42, "index": {"installRecords": {
+                "local": {"source": "path", "sourcePath": external_project,
+                    "installPath": local_plugin},
+                "missing": {"source": "npm", "spec": "absent-plugin@1.0.0",
+                    "installPath": source_paths.state_dir.join("extensions/absent")}
+            }}}).to_string()],
+        ).unwrap();
+        connection.execute_batch(
+            "CREATE TABLE agent_database_leases (lease_id TEXT PRIMARY KEY, owner_pid INTEGER NOT NULL);
+             INSERT INTO agent_database_leases VALUES ('copied-source-owner', 1);",
+        ).unwrap();
+        drop(connection);
+        let source_database_before = fs::read(&database).unwrap();
+
+        let registry = super::env_registry_path(&env, &cwd).unwrap();
+        let registry_before = fs::read(&registry).unwrap();
+        let nested = source_paths.root.join("nested-simulation");
+        let rejected = clone_environment_for_simulation(
+            CloneEnvironmentOptions {
+                source_name: "source".to_string(),
+                name: "blocked-simulation".to_string(),
+                root: Some(nested.display().to_string()),
+            },
+            &env,
+            &cwd,
+        )
+        .unwrap_err();
+        assert!(
+            rejected.contains("overlaps environment source root"),
+            "{rejected}"
+        );
+        assert!(!nested.exists());
+        assert_eq!(fs::read(&registry).unwrap(), registry_before);
+
         let simulation = clone_environment_for_simulation(
             CloneEnvironmentOptions {
                 source_name: "source".to_string(),
@@ -1409,6 +1475,51 @@ mod tests {
         .unwrap();
 
         let target_paths = derive_env_paths(Path::new(&simulation.root));
+        let connection =
+            rusqlite::Connection::open(target_paths.state_dir.join("state/openclaw.sqlite"))
+                .unwrap();
+        let lease_count: i64 = connection
+            .query_row("SELECT COUNT(*) FROM agent_database_leases", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(lease_count, 0);
+        let document: String = connection.query_row(
+            "SELECT value_json FROM config_machine_state WHERE state_key = 'plugins.installedIndex'",
+            [],
+            |row| row.get(0),
+        ).unwrap();
+        drop(connection);
+        let document: Value = serde_json::from_str(&document).unwrap();
+        assert_eq!(document["revision"], 42);
+        let records = &document["index"]["installRecords"];
+        assert_eq!(
+            records["local"]["sourcePath"],
+            external_project.display().to_string()
+        );
+        assert_eq!(
+            records["local"]["installPath"],
+            target_paths.root.join("local-plugin").display().to_string()
+        );
+        assert_eq!(
+            records["missing"]["installPath"],
+            target_paths
+                .state_dir
+                .join("extensions/absent")
+                .display()
+                .to_string()
+        );
+        assert!(!target_paths.state_dir.join("extensions/absent").exists());
+        fs::write(
+            target_paths.root.join("local-plugin/index.js"),
+            "clone-only\n",
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(local_plugin.join("index.js")).unwrap(),
+            "export default {};\n"
+        );
+        assert_eq!(fs::read(&database).unwrap(), source_database_before);
         let config: Value =
             serde_json::from_str(&fs::read_to_string(&target_paths.config_path).unwrap()).unwrap();
         let gateway_port = simulation.gateway_port.unwrap();
